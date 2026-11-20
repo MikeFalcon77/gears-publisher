@@ -1,0 +1,59 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+toolkit = { package = "cf-gears-toolkit", version = "=0.14.0" }
+toolkit-db = { package = "cf-gears-toolkit-db", version = "=0.18.0", features = ["pg"] }
+toolkit-db-macros = { package = "cf-gears-toolkit-db-macros", version = "=0.8.0" }
+toolkit-security = { package = "cf-gears-toolkit-security", version = "=0.14.0" }
+toolkit-macros = { package = "cf-gears-toolkit-macros", version = "=0.8.0" }
+toolkit-canonical-errors = { package = "cf-gears-toolkit-canonical-errors", version = "=0.10.2" }
+toolkit-durable-execution = { package = "cf-gears-toolkit-durable-execution", version = "=0.2.0" }
+api-gateway = { package = "cf-gears-api-gateway", version = "=0.7.5" }
+authn-resolver = { package = "cf-gears-authn-resolver", version = "=0.3.3" }
+firebase-authn-plugin = { package = "cf-gears-firebase-authn-plugin", version = "=0.2.3" }
+types-registry = { package = "cf-gears-types-registry", version = "=0.7.0" }
+sea-orm = { version = "=2.0.4", default-features = false, features = ["macros", "with-json", "with-chrono", "with-uuid"] }
+sea-orm-migration = { version = "=2.0.4", default-features = false }
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+http = "1"
+inventory = "0.3"
+parking_lot = "0.12"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+secrecy = "0.10"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs", "process", "io-util", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = "0.7"
+toml = "0.9"
+tracing = "0.1"
+utoipa = { version = "5", features = ["chrono", "uuid"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+
+[profile.release]
+strip = true
+debug = 0

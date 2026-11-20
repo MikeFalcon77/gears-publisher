@@ -1,0 +1,30 @@
+[Unit]
+Description=gears-publisher (gears-rust release service)
+Wants=network-online.target
+After=network-online.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+User=publisher
+Group=publisher
+WorkingDirectory=/opt/gears-publisher
+EnvironmentFile=/etc/gears-publisher/publisher.env
+ExecStart=/opt/gears-publisher/bin/publisher-server --config /etc/gears-publisher/publisher.yaml
+Restart=on-failure
+RestartSec=5
+# Per-run directories are shared with the build user's group.
+UMask=0002
+# SIGTERM only the server: it cancels the running step and stops that step's process
+# group itself. The step runs again from the start after the restart; the interrupted
+# attempt still counts against the step's retry limit (the limits allow for that).
+# Whatever is left after TimeoutStopSec gets SIGKILL.
+KillMode=mixed
+TimeoutStopSec=90
+LimitNOFILE=65536
+# Hardening that keeps sudo working: options that imply NoNewPrivileges
+# (PrivateDevices, ProtectKernel*, SystemCallFilter, ...) would break the build user.
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

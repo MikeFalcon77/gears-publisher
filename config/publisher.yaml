@@ -1,0 +1,85 @@
+# gears-publisher application configuration.
+#
+# Environment (see .env.example):
+#   DATABASE_URL          PostgreSQL DSN (engine journal, queue, run log)
+#   FIREBASE_PROJECT_ID   Firebase project whose ID tokens are accepted
+#   PUBLISHER_WORK_DIR    clone, per-run files            (default /var/lib/gears-publisher)
+#   PUBLISHER_TARGET_DIR  shared CARGO_TARGET_DIR         (default <work>/target)
+#   PUBLISHER_SECRETS     KEY=value file with CARGO_REGISTRY_TOKEN
+#   PUBLISHER_WEB_ROOT    built UI                         (default web/dist)
+#   PUBLISHER_BIND        listen address, applied by the binary (default 127.0.0.1:8080)
+#   PUBLISHER_RUN_AS      build user for untrusted commands (empty: the service user)
+
+server:
+  home_dir: "~/.gears-publisher"   # ${VAR} is not expanded here
+
+database:
+  servers:
+    primary:
+      engine: postgres
+      dsn: "${DATABASE_URL}"
+      pool:
+        max_conns: 10
+        acquire_timeout: 30s
+
+logging:
+  default:
+    console_level: info
+  sqlx:
+    console_level: warn
+
+gears:
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8080"  # PUBLISHER_BIND overrides
+      auth_disabled: false
+      require_auth_by_default: true
+      enable_docs: false
+      cors_enabled: false
+      openapi:
+        title: gears-publisher
+        version: 0.1.0
+
+  types-registry:
+    database:
+      server: primary
+    config: {}
+
+  authn-resolver:
+    config:
+      vendor: constructorfabric
+
+  firebase-authn-plugin:
+    config:
+      project_id: "${FIREBASE_PROJECT_ID}"
+      # People allowed in: Firebase uid + verified email. A new person signs in once,
+      # copies the uid shown on "Access denied" and is added here; then restart.
+      # The publisher gear reads the same list (anchor below) to name who did what.
+      identities: &identities
+        - uid: "REPLACE_WITH_FIREBASE_UID"
+          email: "someone@example.com"
+          tenant_id: "67656172-732d-7075-626c-697368657201"
+          token_scopes: ["publisher"]
+
+  publisher:
+    database:
+      server: primary
+    config:
+      work_dir: "${PUBLISHER_WORK_DIR:-/var/lib/gears-publisher}"
+      target_dir: "${PUBLISHER_TARGET_DIR:-/var/lib/gears-publisher/target}"
+      secrets_file: "${PUBLISHER_SECRETS:-/etc/gears-publisher/secrets.env}"
+      web_root: "${PUBLISHER_WEB_ROOT:-web/dist}"
+      python: "${PUBLISHER_PYTHON:-python3}"
+      # Absolute CARGO_HOME whose registry and git are cleared before each release
+      # (release-plz.yml does the same); empty: keep them (local development).
+      clean_cargo_home: "${PUBLISHER_CLEAN_CARGO_HOME:-}"
+      queue_dsn: "${DATABASE_URL}"
+      firebase_project_id: "${FIREBASE_PROJECT_ID}"
+      users: *identities
+      # Build user for everything that runs gears-rust's code (sudo -u); empty locally.
+      run_as: "${PUBLISHER_RUN_AS:-}"
+      # `checks` defaults to gears-rust's ci.yml jobs without Docker (see config.rs).
+      env:
+        CARGO_BUILD_JOBS: "${PUBLISHER_CARGO_JOBS:-12}"
+        # gears-rust's Makefile installs git hooks into the clone otherwise.
+        GEARS_NO_HOOKS: "1"

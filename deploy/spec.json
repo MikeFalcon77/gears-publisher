@@ -1,0 +1,14 @@
+{
+  "env": {
+    "shortdomain": "gears-publisher"
+  },
+  "nodes": [
+    {
+      "nodeType": "ubuntu-vps",
+      "nodeGroup": "vds",
+      "count": 1,
+      "fixedCloudlets": 8,
+      "flexibleCloudlets": 16
+    }
+  ]
+}
