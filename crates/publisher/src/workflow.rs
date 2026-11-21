@@ -622,12 +622,16 @@ async fn checks(deps: Arc<Deps>, scope: StepScope, state: ReleaseState) -> StepR
             program
         };
         scope.info(format!("check: {check}")).await;
-        let out = deps
-            .run(
-                &scope,
-                deps.cargo_env(Cmd::new(program, deps.clone_dir()).args(words)),
-            )
-            .await?;
+        let mut cmd = deps.cargo_env(Cmd::new(program, deps.clone_dir()).args(words));
+        let condensed = deps
+            .config
+            .condensed_checks
+            .iter()
+            .any(|c| c.split_whitespace().eq(check.split_whitespace()));
+        if condensed {
+            cmd = cmd.condensed();
+        }
+        let out = deps.run(&scope, cmd).await?;
         if !out.success() {
             scope
                 .info(format!(

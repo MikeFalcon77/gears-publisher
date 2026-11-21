@@ -20,7 +20,7 @@ then does the `release` job again on the merge commit.
 | Step | Does | On failure |
 |---|---|---|
 | `prepare` | clone if missing, `fetch --tags --force`, `checkout -B work origin/main`, `clean -fdx` | retry ×3 |
-| `checks` | gears-rust's `ci.yml` without Docker (`publisher.checks`): `make fmt`, the clippy job's xtask and Python checks, `make clippy`, repo-checks, `make deny`, `make dylint` (`cargo gears lint --dylint`), `make test-no-macros`, `make test-macros`. The database lanes (`test-integration LANE=…`) are not run | stops; fix main and start a new release (Retry checks the same commit: only for flaky or host problems) |
+| `checks` | gears-rust's `ci.yml` without Docker (`publisher.checks`): `make fmt`, the clippy job's xtask and Python checks, `make clippy`, repo-checks, `make deny`, `make dylint` (`cargo gears lint --dylint`), `make test-no-macros`, `make test-macros`. The database lanes (`test-integration LANE=…`) are not run. Output of `publisher.condensed_checks` (default `make deny`) is logged condensed: errors and warnings with context and the end of the output, `… N lines skipped` between them | stops; fix main and start a new release (Retry checks the same commit: only for flaky or host problems) |
 | `pre_release` | the `release` job on main: `snapshot`, `release-plz release`, `collect`. Normally publishes nothing; it finishes an interrupted earlier release before versions are computed | like `publish` |
 | `release_pr` | `release-plz release-pr -o json` → PR and packages. Dry run: `release-plz update` + `git diff --stat` | retry ×3 |
 | `wait_merge` | polls `gh pr view` every minute: MERGED → merge commit, CLOSED → fails | up to 14 days |

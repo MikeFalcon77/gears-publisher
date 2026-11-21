@@ -67,13 +67,26 @@ pub struct Cmd {
     pub secrets: Vec<(String, SecretString)>,
     /// Keep stdout in [`CmdOutput::stdout`].
     pub capture: bool,
-    /// Do not log stdout (it carries a secret, e.g. `gh auth token`).
-    pub quiet_stdout: bool,
+    /// What of the output reaches the run log.
+    pub logged: Logged,
     /// Substrings to look for in every line; found ones end up in [`CmdOutput::seen`].
     pub watch: Vec<&'static str>,
     /// Runs as the service user even when a build user is configured: only for tools
     /// that execute none of the repository's code and need the service's credentials (`gh`).
     pub trusted: bool,
+}
+
+/// What of a command's output is logged. Masking, `tail`, `watch` and `capture` see
+/// every line regardless.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Logged {
+    #[default]
+    All,
+    /// Stderr only: stdout carries a secret (`gh auth token`).
+    Stderr,
+    /// Errors and warnings with some context (see [`Condenser`]): for tools whose full
+    /// output is too large to read (`cargo deny`).
+    Condensed,
 }
 
 impl Cmd {
@@ -85,7 +98,7 @@ impl Cmd {
             env: Vec::new(),
             secrets: Vec::new(),
             capture: false,
-            quiet_stdout: false,
+            logged: Logged::All,
             watch: Vec::new(),
             trusted: false,
         }
@@ -122,12 +135,20 @@ impl Cmd {
     #[must_use]
     pub fn quiet(mut self) -> Self {
         self.capture = true;
-        self.quiet_stdout = true;
+        self.logged = Logged::Stderr;
         self
     }
     #[must_use]
     pub fn trusted(mut self) -> Self {
         self.trusted = true;
+        self
+    }
+    #[must_use]
+    /// No effect after [`Cmd::quiet`]: its stdout must not be logged at all.
+    pub fn condensed(mut self) -> Self {
+        if self.logged == Logged::All {
+            self.logged = Logged::Condensed;
+        }
         self
     }
     #[must_use]
@@ -334,6 +355,7 @@ impl Exec for ProcessExec {
 
         let mut output = CmdOutput::default();
         let mut tail = VecDeque::with_capacity(TAIL_LINES);
+        let mut logger = OutputLog::start(scope, &cmd, &masker).await;
         let consume = async {
             while let Some(chunk) = rx.recv().await {
                 let (stream, text) = match chunk {
@@ -342,7 +364,7 @@ impl Exec for ProcessExec {
                             output.stdout.push_str(&text);
                             output.stdout.push('\n');
                         }
-                        if cmd.quiet_stdout {
+                        if cmd.logged == Logged::Stderr {
                             continue;
                         }
                         ("stdout", text)
@@ -359,7 +381,7 @@ impl Exec for ProcessExec {
                     tail.pop_front();
                 }
                 tail.push_back(shown.clone());
-                log(scope, stream, shown).await;
+                logger.line(stream, shown).await;
             }
         };
 
@@ -375,39 +397,39 @@ impl Exec for ProcessExec {
                     child.wait().await
                 }
             };
-            if !drained
+            let stuck = !drained
                 && tokio::time::timeout(DRAIN_AFTER_EXIT, &mut consume)
                     .await
-                    .is_err()
-            {
-                log(
-                    scope,
-                    "info",
-                    "output still open after exit; stopped reading".to_owned(),
-                )
-                .await;
-            }
-            status
+                    .is_err();
+            (status, stuck)
         };
-        let status = tokio::select! {
-            status = finish => status,
-            () = scope.cancel.cancelled() => {
-                terminate(pid, self.run_as(&cmd), &mut child).await;
-                for task in [stdout, stderr].into_iter().flatten() {
-                    task.abort();
-                }
-                log(scope, "info", "cancelled: process group terminated".to_owned()).await;
-                return Err(ExecError::Cancelled);
-            }
+        // `finish` borrows the logger; it is dropped before the logger is flushed.
+        let finished = tokio::select! {
+            finished = finish => Some(finished),
+            () = scope.cancel.cancelled() => None,
         };
+        let Some((status, stuck)) = finished else {
+            terminate(pid, self.run_as(&cmd), &mut child).await;
+            stop(stdout, stderr);
+            logger.finish().await;
+            log(
+                scope,
+                "info",
+                "cancelled: process group terminated".to_owned(),
+            )
+            .await;
+            return Err(ExecError::Cancelled);
+        };
+        // Finished, or stuck on a pipe a background process keeps open.
+        stop(stdout, stderr);
+        logger.finish().await;
+        if stuck {
+            log(scope, "info", STUCK.to_owned()).await;
+        }
         let status = status.map_err(|source| ExecError::Io {
             program: cmd.program.clone(),
             source,
         })?;
-        // Finished, or stuck on a pipe a background process keeps open.
-        for task in [stdout, stderr].into_iter().flatten() {
-            task.abort();
-        }
         output.code = status.code();
         output.tail = tail.into_iter().collect();
         let exit = output
@@ -415,6 +437,57 @@ impl Exec for ProcessExec {
             .map_or_else(|| "by signal".to_owned(), |c| c.to_string());
         log(scope, "info", format!("exit {exit}")).await;
         Ok(output)
+    }
+}
+
+const STUCK: &str = "output still open after exit; stopped reading";
+
+/// Stops reading the pipes.
+fn stop(stdout: Option<Pump>, stderr: Option<Pump>) {
+    for task in [stdout, stderr].into_iter().flatten() {
+        task.abort();
+    }
+}
+
+type Pump = tokio::task::JoinHandle<std::io::Result<()>>;
+
+/// Writes output lines to the run log as [`Cmd::logged`] says.
+struct OutputLog<'a> {
+    scope: &'a StepScope,
+    condenser: Option<Condenser>,
+}
+
+impl<'a> OutputLog<'a> {
+    async fn start(scope: &'a StepScope, cmd: &Cmd, masker: &Masker) -> Self {
+        let condensed = cmd.logged == Logged::Condensed;
+        if condensed {
+            let note = format!(
+                "output condensed to errors and warnings; run `{}` locally for all of it",
+                masker.mask(&cmd.display())
+            );
+            log(scope, "info", note).await;
+        }
+        Self {
+            scope,
+            condenser: condensed.then(Condenser::default),
+        }
+    }
+
+    async fn line(&mut self, stream: &'static str, line: String) {
+        match self.condenser.as_mut() {
+            Some(condenser) => {
+                for (stream, line) in condenser.push(stream, line) {
+                    log(self.scope, stream, line).await;
+                }
+            }
+            None => log(self.scope, stream, line).await,
+        }
+    }
+
+    async fn finish(self) {
+        for (stream, line) in self.condenser.map(Condenser::finish).unwrap_or_default() {
+            log(self.scope, stream, line).await;
+        }
     }
 }
 
@@ -461,6 +534,118 @@ async fn terminate(pid: Option<u32>, run_as: Option<&RunAs>, child: &mut tokio::
         signal_group("-KILL").await;
     }
     let _ = child.kill().await;
+}
+
+/// Lines of context kept before a problem.
+const CONDENSE_BEFORE: usize = 2;
+/// Lines of one diagnostic kept (cargo-deny's inclusion trees run to hundreds).
+const CONDENSE_BLOCK: usize = 40;
+/// Lines kept from the end of the output after the last diagnostic (the summary,
+/// `make: ***`).
+const CONDENSE_TAIL: usize = 15;
+
+/// Reduces output to its errors and warnings: each diagnostic (up to a blank line or
+/// [`CONDENSE_BLOCK`] lines) with [`CONDENSE_BEFORE`] lines before it, plus up to
+/// [`CONDENSE_TAIL`] lines of the end that follow the last one; gaps become one
+/// `… N lines skipped` note.
+#[derive(Default)]
+pub struct Condenser {
+    /// Recent lines not logged, oldest first.
+    held: VecDeque<(&'static str, String)>,
+    /// Lines not logged since the last logged one (including `held`).
+    skipped: usize,
+    block: Block,
+}
+
+#[derive(Default, Clone, Copy)]
+enum Block {
+    /// Outside a diagnostic, or past [`CONDENSE_BLOCK`] lines of one: lines are held.
+    #[default]
+    None,
+    /// Inside a diagnostic, this many lines logged.
+    Open(usize),
+}
+
+impl Condenser {
+    /// Lines to log for one line of output.
+    pub fn push(&mut self, stream: &'static str, line: String) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        if is_problem(&line) {
+            let mut before = self.held.len().min(CONDENSE_BEFORE);
+            // One more line costs no more than a note saying it was skipped.
+            if self.skipped == before + 1 && self.held.len() > before {
+                before += 1;
+            }
+            self.flush_skipped(before, &mut out);
+            let keep = self.held.len() - before;
+            out.extend(self.held.drain(..).skip(keep));
+            out.push((stream, line));
+            self.block = Block::Open(1);
+            return out;
+        }
+        let blank = line.trim().is_empty();
+        match self.block {
+            Block::Open(n) if blank || n < CONDENSE_BLOCK => {
+                self.block = if blank {
+                    Block::None
+                } else {
+                    Block::Open(n + 1)
+                };
+                out.push((stream, line));
+                return out;
+            }
+            Block::Open(_) => self.block = Block::None,
+            Block::None => {}
+        }
+        self.hold(stream, line);
+        out
+    }
+
+    /// Lines to log at the end of the output.
+    #[must_use]
+    pub fn finish(mut self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        let tail = self.held.len();
+        self.flush_skipped(tail, &mut out);
+        out.extend(self.held.drain(..));
+        out
+    }
+
+    fn hold(&mut self, stream: &'static str, line: String) {
+        if self.held.len() == CONDENSE_TAIL {
+            self.held.pop_front();
+        }
+        self.held.push_back((stream, line));
+        self.skipped += 1;
+    }
+
+    /// Notes the lines skipped, except the `shown` ones about to be logged.
+    fn flush_skipped(&mut self, shown: usize, out: &mut Vec<(&'static str, String)>) {
+        let n = self.skipped - shown;
+        if n > 0 {
+            let s = if n == 1 { "" } else { "s" };
+            out.push(("info", format!("… {n} line{s} skipped")));
+        }
+        self.skipped = 0;
+    }
+}
+
+/// `error: …`, `warning[duplicate]: …`, a logged `ERROR`/`WARN`, `make: *** …`.
+fn is_problem(line: &str) -> bool {
+    let diagnostic = ["error", "warning"].iter().any(|level| {
+        line.strip_prefix(level).is_some_and(|rest| {
+            let rest = match rest.strip_prefix('[') {
+                Some(code) => code.split_once(']').map_or("", |(_, rest)| rest),
+                None => rest,
+            };
+            rest.starts_with(": ")
+        })
+    });
+    diagnostic
+        || ["[ERROR]", "[WARN]", " ERROR ", " WARN "]
+            .iter()
+            .any(|m| line.contains(m))
+        || (line.starts_with("make") && line.contains(": ***"))
 }
 
 /// Replaces secret values with `***`.
@@ -613,6 +798,161 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.stdout, "none base own\n");
+    }
+
+    fn condense(input: &[&str]) -> Vec<String> {
+        let mut condenser = Condenser::default();
+        let mut out = Vec::new();
+        for line in input {
+            out.extend(condenser.push("stderr", (*line).to_owned()));
+        }
+        out.extend(condenser.finish());
+        out.into_iter().map(|(_, line)| line).collect()
+    }
+
+    fn numbered(prefix: &str, n: usize) -> Vec<String> {
+        (1..=n).map(|i| format!("{prefix}{i}")).collect()
+    }
+
+    #[test]
+    fn problems_are_recognised() {
+        for line in [
+            "error: failed to load advisory database",
+            "error[banned]: crate 'openssl' is explicitly banned",
+            "warning[duplicate]: found 2 duplicate entries for crate 'syn'",
+            "2026-11-21 10:00:00 [WARN] unable to fetch",
+            "make: *** [Makefile:12: deny] Error 4",
+            "make[1]: *** [deny] Error 1",
+        ] {
+            assert!(is_problem(line), "{line}");
+        }
+        for line in [
+            "   ├── errors v1.0.0",
+            "warnings ok",
+            "error-chain v0.12.4",
+            "   │ error: nested",
+            "advisories ok, bans FAILED",
+        ] {
+            assert!(!is_problem(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn diagnostics_are_kept_with_context_and_gaps_noted() {
+        let mut input = numbered("noise", 10);
+        input.extend(
+            [
+                "warning[duplicate]: syn",
+                "  ┌─ Cargo.lock:1:1",
+                "  ├ syn v1",
+                "",
+            ]
+            .map(String::from),
+        );
+        input.extend(numbered("tree", 30));
+        input.push("error[banned]: openssl".into());
+        input.push("  └── native-tls".into());
+        input.push(String::new());
+        input.extend(numbered("more", 20));
+        input.push("bans FAILED".into());
+        let input: Vec<&str> = input.iter().map(String::as_str).collect();
+        let mut expected = vec!["… 8 lines skipped", "noise9", "noise10"];
+        expected.extend([
+            "warning[duplicate]: syn",
+            "  ┌─ Cargo.lock:1:1",
+            "  ├ syn v1",
+            "",
+        ]);
+        expected.extend(["… 28 lines skipped", "tree29", "tree30"]);
+        expected.extend(["error[banned]: openssl", "  └── native-tls", ""]);
+        expected.push("… 6 lines skipped");
+        let more = numbered("more", 20);
+        expected.extend(more[6..].iter().map(String::as_str));
+        expected.push("bans FAILED");
+        assert_eq!(condense(&input), expected);
+    }
+
+    #[test]
+    fn a_gap_of_one_line_is_shown_not_noted() {
+        assert_eq!(
+            condense(&["a", "b", "c", "error: x", "", "after"]),
+            ["a", "b", "c", "error: x", "", "after"]
+        );
+        let out = condense(&["a", "b", "c", "d", "error: x"]);
+        assert_eq!(out, ["… 2 lines skipped", "c", "d", "error: x"]);
+    }
+
+    #[test]
+    fn a_quiet_command_stays_quiet_when_condensed() {
+        assert_eq!(
+            Cmd::new("gh", ".").quiet().condensed().logged,
+            Logged::Stderr
+        );
+    }
+
+    #[test]
+    fn a_long_diagnostic_is_cut() {
+        let mut input = vec!["warning[duplicate]: syn".to_owned()];
+        input.extend(numbered("tree", 100));
+        input.push(String::new());
+        input.extend(numbered("after", 3));
+        let input: Vec<&str> = input.iter().map(String::as_str).collect();
+        let out = condense(&input);
+        assert_eq!(out.len(), CONDENSE_BLOCK + 1 + CONDENSE_TAIL);
+        assert_eq!(
+            out[CONDENSE_BLOCK - 1],
+            format!("tree{}", CONDENSE_BLOCK - 1)
+        );
+        // The rest of the tree and its blank line, minus the tail shown.
+        assert_eq!(
+            out[CONDENSE_BLOCK],
+            format!(
+                "… {} lines skipped",
+                100 - (CONDENSE_BLOCK - 1) + 1 - (CONDENSE_TAIL - 3)
+            )
+        );
+        assert_eq!(out.last().unwrap(), "after3");
+    }
+
+    #[test]
+    fn output_without_problems_keeps_its_tail() {
+        let input = numbered("line", 100);
+        let input: Vec<&str> = input.iter().map(String::as_str).collect();
+        let out = condense(&input);
+        assert_eq!(out[0], format!("… {} lines skipped", 100 - CONDENSE_TAIL));
+        assert_eq!(out[1..], input[100 - CONDENSE_TAIL..]);
+        assert_eq!(condense(&["a", "b"]), ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn condensed_output_is_logged_in_part_but_seen_whole() {
+        let journal = Arc::new(MemoryJournal::default());
+        let exec = ProcessExec {
+            base_env: HashMap::new(),
+            run_as: None,
+        };
+        let out = exec
+            .run(
+                &scope(journal.clone()),
+                Cmd::new("sh", ".")
+                    .args([
+                        "-c",
+                        "seq 1 100; echo 'error[banned]: openssl'; echo; seq 1 100; exit 4",
+                    ])
+                    .watch(&["50"])
+                    .condensed(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.code, Some(4));
+        assert!(out.saw("50"));
+        let lines = journal.lines.lock();
+        let text: Vec<&str> = lines.iter().map(|l| l.line.as_str()).collect();
+        assert!(text[1].starts_with("output condensed"), "{text:?}");
+        assert!(text.contains(&"error[banned]: openssl"));
+        assert!(text.contains(&"… 98 lines skipped"));
+        assert_eq!(text.last(), Some(&"exit 4"));
+        assert!(text.len() < 30, "{text:?}");
     }
 
     #[tokio::test]

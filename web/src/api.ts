@@ -78,6 +78,9 @@ export class Waker {
 /** How often a settled run is checked again in case someone else continued it. */
 const IDLE_RECHECK = 60000;
 
+/** The server's maximum page size for `/runs/{id}/log`. */
+const LOG_PAGE = 5000;
+
 /**
  * Follows `/runs/{id}/stream` until `signal` aborts, reconnecting with the last seen
  * `seq`. EventSource cannot send `Authorization`, so this reads the stream with fetch.
@@ -97,6 +100,14 @@ export async function followRun(
   while (!signal.aborted) {
     let ended = false;
     try {
+      // The backlog comes from the paged endpoint, which is gzipped (SSE is not, and
+      // its per-line JSON is ~20x the compressed size); the stream then sends the tail.
+      for (;;) {
+        const page = await api<LogLine[]>(`/runs/${id}/log?after=${after()}&limit=${LOG_PAGE}`);
+        if (signal.aborted) return;
+        for (const line of page) handlers.onLog(line);
+        if (page.length < LOG_PAGE) break;
+      }
       const jwt = await authorized(force);
       const response = await fetch(`${BASE}/runs/${id}/stream?after=${after()}`, {
         headers: { Authorization: `Bearer ${jwt}`, Accept: 'text/event-stream' },
@@ -145,9 +156,9 @@ export async function fullLog(id: string): Promise<string> {
   const out: string[] = [];
   let after = 0;
   for (;;) {
-    const page = await api<LogLine[]>(`/runs/${id}/log?after=${after}&limit=5000`);
+    const page = await api<LogLine[]>(`/runs/${id}/log?after=${after}&limit=${LOG_PAGE}`);
     for (const l of page) out.push(`${l.ts} ${l.step}#${l.attempt} ${l.stream.padEnd(6)} ${l.line}`);
-    if (page.length < 5000) return out.join('\n') + '\n';
+    if (page.length < LOG_PAGE) return out.join('\n') + '\n';
     after = page[page.length - 1].seq;
   }
 }

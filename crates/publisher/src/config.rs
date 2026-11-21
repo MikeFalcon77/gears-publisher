@@ -51,6 +51,10 @@ pub struct PublisherConfig {
     /// `ci.yml` that need no Docker.
     #[serde(default = "defaults::checks")]
     pub checks: Vec<String>,
+    /// Checks whose output is logged condensed to errors and warnings with some
+    /// context (cargo-deny prints tens of thousands of lines of dependency trees).
+    #[serde(default = "defaults::condensed_checks")]
+    pub condensed_checks: Vec<String>,
     /// Extra environment for every subprocess (`CARGO_BUILD_JOBS`, `PATH`, ...).
     #[serde(default)]
     #[expand_vars]
@@ -193,6 +197,9 @@ mod defaults {
         ]
         .map(String::from)
         .to_vec()
+    }
+    pub fn condensed_checks() -> Vec<String> {
+        vec!["make deny".into()]
     }
     pub fn web_root() -> String {
         "web/dist".into()
