@@ -575,3 +575,28 @@ async fn checks_follow_main_when_it_moves_before_the_release_pr() {
     assert_eq!(state.main_sha.as_deref(), Some("fix789"));
     assert!(h.exec.calls_matching("checkout --force -B work fix789") >= 1);
 }
+
+#[tokio::test]
+async fn checks_fetch_git_dependencies_with_the_token() {
+    // `make dylint` builds its lints from a git dependency on GitHub.
+    let exec = release_exec().on("make dylint", |cmd, _| {
+        assert!(cmd.secrets.iter().any(|(k, _)| k == "GIT_CONFIG_VALUE_0"));
+        assert!(
+            cmd.env
+                .iter()
+                .any(|(k, v)| k == "CARGO_NET_GIT_FETCH_WITH_CLI" && v == "true")
+        );
+        ok("")
+    });
+    let exec = FakeExec {
+        rules: exec.rules.into_iter().rev().collect(),
+        ..FakeExec::default()
+    };
+    let h = harness(exec, published(), &fast());
+    let run = TestRuntime::new()
+        .run(&h.workflow, ReleaseInput { dry_run: true })
+        .await
+        .unwrap();
+    assert_eq!(run.attempts("checks"), 1);
+    assert_eq!(h.exec.calls_matching("make dylint"), 1);
+}

@@ -395,18 +395,7 @@ impl Deps {
     /// Not for release-plz, which authenticates with `GIT_TOKEN` itself (two
     /// `Authorization` headers are rejected).
     async fn with_git_auth(&self, scope: &StepScope, cmd: Cmd) -> Result<Cmd, ActivityError> {
-        use base64::Engine as _;
-        use secrecy::ExposeSecret as _;
-        let token = self.gh_token(scope).await?;
-        let basic = base64::engine::general_purpose::STANDARD
-            .encode(format!("x-access-token:{}", token.expose_secret()));
-        Ok(cmd
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
-            .secret(
-                "GIT_CONFIG_VALUE_0",
-                SecretString::from(format!("AUTHORIZATION: basic {basic}")),
-            ))
+        Ok(git_auth(cmd, &self.gh_token(scope).await?))
     }
 
     /// `release_retry.py <command>`; it fetches tags, so it gets git credentials.
@@ -617,9 +606,29 @@ async fn prepare(deps: Arc<Deps>, scope: StepScope, input: ReleaseInput) -> Step
 }
 
 /// The configured check commands (gears-rust's CI). A failure stops the run until Retry.
+/// The token as git's `http.extraheader` (see [`Deps::with_git_auth`]).
+fn git_auth(cmd: Cmd, token: &SecretString) -> Cmd {
+    use base64::Engine as _;
+    use secrecy::ExposeSecret as _;
+    let basic = base64::engine::general_purpose::STANDARD
+        .encode(format!("x-access-token:{}", token.expose_secret()));
+    cmd.env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+        .secret(
+            "GIT_CONFIG_VALUE_0",
+            SecretString::from(format!("AUTHORIZATION: basic {basic}")),
+        )
+}
+
 async fn checks(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState) -> StepResult {
     follow_main(&deps, &scope, &mut state).await?;
     deps.ensure_tree(&scope, &state, Tree::Main).await?;
+    // Checks fetch git dependencies from GitHub too (`make dylint` builds its lints
+    // from cargo-gears), and GitHub refuses anonymous reads of the organization's
+    // repositories. cargo's built-in libgit2 ignores `http.extraheader`, so cargo
+    // fetches with the git CLI. The token is already given to main's code by
+    // `release-plz release`; never give it to PR checks.
+    let token = deps.gh_token(&scope).await?;
     for check in &deps.config.checks {
         let mut words = check.split_whitespace();
         let Some(program) = words.next() else {
@@ -631,7 +640,11 @@ async fn checks(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState) -> S
             program
         };
         scope.info(format!("check: {check}")).await;
-        let mut cmd = deps.cargo_env(Cmd::new(program, deps.clone_dir()).args(words));
+        let mut cmd = git_auth(
+            deps.cargo_env(Cmd::new(program, deps.clone_dir()).args(words))
+                .env("CARGO_NET_GIT_FETCH_WITH_CLI", "true"),
+            &token,
+        );
         let condensed = deps
             .config
             .condensed_checks
