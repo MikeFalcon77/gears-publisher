@@ -11,10 +11,13 @@ import {
   Download,
   FileCode2,
   FlaskConical,
+  Info,
   ListTree,
   Loader2,
+  RotateCw,
   LocateFixed,
   Search,
+  ShieldAlert,
   X,
   XCircle,
 } from 'lucide-react';
@@ -27,17 +30,28 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { cn } from '@/lib/utils';
 import { fullLog } from './api';
 import {
-  extractProblems,
+  attemptOutcome,
+  type AttemptTrigger,
+  type ReleaseAttempt,
+  groupProblems,
+  isMildDeny,
+  runLabel,
+  type CommandProblems,
+  type CommandStatus,
   type LogModel,
+  type ProblemKind,
+  type Run,
   failedExit,
+  SKIPPED,
   flatten,
   type CommandGroup,
   type Problem,
   type Row,
   type Section,
 } from './logmodel';
-import { formatDuration } from './runview';
-import type { LogLine } from './types';
+import { formatDuration, formatTime, statusLabel, tone } from './runview';
+import { Badge as StatusBadge } from './ui';
+import type { LogLine, RunState } from './types';
 
 const ROW = 20;
 
@@ -54,32 +68,41 @@ export function LogViewer({
   runId,
   log,
   steps,
-  failed,
+  state,
 }: {
   runId: string;
   log: LogSource;
   steps: string[];
-  failed: boolean;
+  /** The release's state, shown for its latest attempt. */
+  state: RunState;
 }) {
-  // The model grows in place; `version` changes whenever it does. A new array makes
-  // the memoised rows below recompute.
-  const sections = useMemo(
-    () => [...log.model.sections],
+  // The model grows in place; `version` changes whenever it does. New arrays make the
+  // memoised rows below recompute.
+  const [sections, attempts] = useMemo(
+    (): [Section[], ReleaseAttempt[]] => [[...log.model.sections], [...log.model.attempts]],
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [log.model, log.version],
   );
-  const problems = useMemo(() => extractProblems(sections), [sections]);
+  const [attempt, chooseAttempt] = useAttemptChoice(attempts.length);
+  const visible = useMemo(
+    () => (attempts.length > 1 ? sections.filter((s) => s.release === attempt) : sections),
+    [sections, attempts.length, attempt],
+  );
+  const commands = useMemo(() => groupProblems(visible), [visible]);
+  // Commands still failing; interrupted and recovered ones do not count.
+  const failing = commands.filter((c) => c.status === 'failed' || c.status === 'retrying').length;
   const [tab, setTab] = useState<'problems' | 'log'>('log');
   const [jump, setJump] = useState<{ seq: number; at: number } | null>(null);
 
   // A failed run opens on what broke, once.
   const switched = useRef(false);
+  const failed = state.kind === 'failed';
   useEffect(() => {
-    if (!switched.current && failed && problems.length) {
+    if (!switched.current && failed && failing) {
       switched.current = true;
       setTab('problems');
     }
-  }, [failed, problems.length]);
+  }, [failed, failing]);
 
   const showInLog = (seq: number) => {
     setTab('log');
@@ -92,13 +115,16 @@ export function LogViewer({
       onValueChange={(v) => setTab(v as 'problems' | 'log')}
       className="flex min-h-[60vh] flex-1 flex-col gap-0 overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200 lg:min-h-0"
     >
+      {attempts.length > 1 && (
+        <AttemptList attempts={attempts} selected={attempt} onSelect={chooseAttempt} state={state} />
+      )}
       <div className="flex items-center gap-2 border-b border-slate-200 px-3 py-2">
         <TabsList>
           <TabsTrigger value="problems" className="gap-1.5">
             <Bug className="size-4" /> Problems
-            {problems.length > 0 && (
+            {failing > 0 && (
               <Badge variant="destructive" className="h-5 min-w-5 px-1.5">
-                {problems.length}
+                {failing}
               </Badge>
             )}
           </TabsTrigger>
@@ -120,13 +146,97 @@ export function LogViewer({
         <DownloadButton runId={runId} />
       </div>
       <TabsContent value="problems" className="min-h-0 flex-1 overflow-auto">
-        <ProblemList problems={problems} onShow={showInLog} empty={log.lines.length === 0} />
+        {/* Keyed by attempt: what is open in one attempt means nothing in another. */}
+        <ProblemList key={attempt} commands={commands} onShow={showInLog} empty={log.lines.length === 0} />
       </TabsContent>
       <TabsContent value="log" className="flex min-h-0 flex-1 flex-col" forceMount hidden={tab !== 'log'}>
-        <LogTree sections={sections} log={log} steps={steps} jump={jump} />
+        <LogTree sections={visible} log={log} steps={steps} jump={jump} />
       </TabsContent>
     </Tabs>
   );
+}
+
+/**
+ * The release attempt shown: the latest unless one was picked, so a new Retry comes
+ * into view by itself. A pick is kept in `?attempt=` for sharing the link.
+ */
+function useAttemptChoice(count: number): [number, (n: number) => void] {
+  const [picked, setPicked] = useState<number | null>(() => {
+    const n = Number(new URLSearchParams(window.location.search).get('attempt'));
+    return Number.isInteger(n) && n > 0 ? n : null;
+  });
+  const shown = picked !== null && picked <= count ? picked : count;
+  const choose = (n: number) => {
+    const next = n === count ? null : n;
+    setPicked(next);
+    const url = new URL(window.location.href);
+    if (next === null) url.searchParams.delete('attempt');
+    else url.searchParams.set('attempt', String(next));
+    window.history.replaceState(null, '', url);
+  };
+  return [shown, choose];
+}
+
+const triggerLabel: Record<AttemptTrigger, string> = { start: 'Start', retry: 'Retry', resume: 'Resume' };
+
+/** The release's attempts, newest first: its start and every Retry/Resume. */
+function AttemptList({
+  attempts,
+  selected,
+  onSelect,
+  state,
+}: {
+  attempts: ReleaseAttempt[];
+  selected: number;
+  onSelect: (n: number) => void;
+  state: RunState;
+}) {
+  return (
+    <div className="border-b border-slate-200 px-2 py-2">
+      <div className="px-2 pb-1 text-[11px] font-semibold tracking-wide text-slate-500 uppercase">Attempts</div>
+      <ol className="max-h-36 overflow-auto">
+        {[...attempts].reverse().map((a) => {
+          const latest = a.number === attempts.length;
+          return (
+            <li key={a.number}>
+              <button
+                onClick={() => onSelect(a.number)}
+                aria-current={a.number === selected}
+                className={cn(
+                  'flex w-full flex-wrap items-center gap-x-2 gap-y-0.5 rounded-md px-2 py-1 text-left text-xs hover:bg-slate-50',
+                  a.number === selected && 'bg-sky-50 ring-1 ring-sky-200 hover:bg-sky-50',
+                )}
+              >
+                <span className="font-mono font-semibold text-slate-900">#{a.number}</span>
+                <span className="font-medium text-slate-700">{triggerLabel[a.trigger]}</span>
+                <span className="text-slate-500" title={a.by}>
+                  {formatTime(a.startedAt)}
+                  {a.by && ` · ${a.by.split('@')[0]}`}
+                </span>
+                <span className="ml-auto flex items-center gap-2">
+                  {latest ? <StatusBadge tone={tone(state)}>{statusLabel(state)}</StatusBadge> : <AttemptEnd attempt={a} />}
+                  <span className="text-slate-500 tabular-nums">{formatDuration(a.startedAt, a.endedAt)}</span>
+                </span>
+              </button>
+            </li>
+          );
+        })}
+      </ol>
+    </div>
+  );
+}
+
+function AttemptEnd({ attempt }: { attempt: ReleaseAttempt }) {
+  const end = attemptOutcome(attempt);
+  if (end.cancelled)
+    return <span className="text-slate-500">cancelled{attempt.cancelledBy && ` by ${attempt.cancelledBy.split('@')[0]}`}</span>;
+  if (end.error)
+    return (
+      <span className="font-mono text-rose-700">
+        {end.step}: {end.error}
+      </span>
+    );
+  return <span className="text-slate-500">stopped in {end.step ?? '—'}</span>;
 }
 
 function DownloadButton({ runId }: { runId: string }) {
@@ -165,24 +275,75 @@ function DownloadButton({ runId }: { runId: string }) {
 // ---------------------------------------------------------------------------------
 // Problems
 
-const kindMeta: Record<Problem['kind'], { label: string; icon: typeof Bug; className: string }> = {
+type FindingKind = Exclude<ProblemKind, 'summary'>;
+
+const kindMeta: Record<FindingKind, { label: string; icon: typeof Bug; className: string }> = {
   compile: { label: 'compile', icon: FileCode2, className: 'text-rose-700' },
   test: { label: 'test', icon: FlaskConical, className: 'text-rose-700' },
   error: { label: 'error', icon: XCircle, className: 'text-rose-700' },
-  step: { label: 'step', icon: AlertTriangle, className: 'text-amber-700' },
-  summary: { label: 'summary', icon: CircleSlash, className: 'text-slate-500' },
+  deny: { label: 'cargo-deny', icon: ShieldAlert, className: 'text-rose-700' },
 };
 
+function findingMeta(problem: Problem) {
+  if (isMildDeny(problem) && problem.code)
+    return { label: problem.code, icon: AlertTriangle, className: 'text-amber-600' };
+  const meta = kindMeta[problem.kind as FindingKind];
+  return problem.kind === 'deny' && problem.code ? { ...meta, label: problem.code } : meta;
+}
+
+const statusMeta: Record<CommandStatus, { icon: typeof Bug; className: string }> = {
+  failed: { icon: XCircle, className: 'text-rose-700' },
+  retrying: { icon: RotateCw, className: 'text-amber-600' },
+  interrupted: { icon: CircleSlash, className: 'text-slate-400' },
+  recovered: { icon: CheckCircle2, className: 'text-emerald-600' },
+};
+
+/** Runs that have something to show: failures and interruptions. */
+function shownRuns(command: CommandProblems): Run[] {
+  return command.runs.filter((r) => r.outcome === 'failed' || r.outcome === 'interrupted');
+}
+
+function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? '' : 's'}`;
+}
+
+/** `exit 2 · 8s · 7 findings`. The engine's step attempt is left out: next to the
+ * release's attempts it reads as one of them. */
+function runMeta(run: Run): string {
+  const parts: string[] = [];
+  if (run.outcome === 'interrupted') parts.push('interrupted');
+  else if (run.group) parts.push(`exit ${run.group.exit}`);
+  const took = formatDuration(run.startedAt, run.endedAt);
+  if (took && run.group) parts.push(took);
+  if (run.problems.length) parts.push(plural(run.problems.length, 'finding'));
+  return parts.join(' · ');
+}
+
+function commandMeta(command: CommandProblems, shown: Run[]): string {
+  const parts: string[] = [];
+  const failed = shown.filter((r) => r.outcome === 'failed');
+  const last = command.runs[command.runs.length - 1];
+  if (shown.length === 1) parts.push(runMeta(shown[0]));
+  else if (!failed.length) parts.push(`${plural(shown.length, 'interrupted run')} (${runLabel(shown.map((r) => r.ordinal))})`);
+  else {
+    parts.push(plural(shown.length, 'run'));
+    if (failed.length < shown.length) parts.push(`${shown.length - failed.length} interrupted`);
+  }
+  if (command.status === 'recovered') parts.push(`ok in #${last.ordinal}`);
+  if (command.status === 'retrying') parts.push(`running #${last.ordinal}`);
+  return parts.join(' · ');
+}
+
 function ProblemList({
-  problems,
+  commands,
   onShow,
   empty,
 }: {
-  problems: Problem[];
+  commands: CommandProblems[];
   onShow: (seq: number) => void;
   empty: boolean;
 }) {
-  if (!problems.length)
+  if (!commands.length)
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2 p-8 text-sm text-slate-500">
         <CheckCircle2 className="size-8 text-emerald-500" />
@@ -191,10 +352,187 @@ function ProblemList({
     );
   return (
     <ul className="divide-y divide-slate-100">
-      {problems.map((problem, index) => (
-        <ProblemItem key={problem.id} problem={problem} defaultOpen={index < 3} onShow={onShow} />
+      {commands.map((command, index) => (
+        <CommandItem
+          key={command.key}
+          command={command}
+          defaultOpen={index < 3 && (command.status === 'failed' || command.status === 'retrying')}
+          onShow={onShow}
+        />
       ))}
     </ul>
+  );
+}
+
+function CommandItem({
+  command,
+  defaultOpen,
+  onShow,
+}: {
+  command: CommandProblems;
+  defaultOpen: boolean;
+  onShow: (seq: number) => void;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const shown = shownRuns(command);
+  const meta = statusMeta[command.status];
+  const Icon = meta.icon;
+  const muted = command.status === 'interrupted' || command.status === 'recovered';
+  return (
+    <li className="px-3 py-2.5">
+      <Collapsible open={open} onOpenChange={setOpen}>
+        <CollapsibleTrigger asChild>
+          <button className="flex w-full items-start gap-2 text-left">
+            <span className="mt-0.5 text-slate-400">
+              {open ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
+            </span>
+            <Icon className={cn('mt-0.5 size-4 shrink-0', meta.className)} />
+            <span className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-3 gap-y-0.5">
+              <span className={cn('text-sm font-medium break-words', muted ? 'text-slate-500' : 'text-slate-900')}>
+                {command.step} · <span className="font-mono">{command.command ?? 'step failed'}</span>
+              </span>
+              <span className="text-xs text-slate-500">{commandMeta(command, shown)}</span>
+            </span>
+          </button>
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <div className="mt-2 ml-6">
+            {shown.length === 1 ? (
+              <RunBody run={shown[0]} onShow={onShow} />
+            ) : (
+              <RunList runs={shown} onShow={onShow} />
+            )}
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
+    </li>
+  );
+}
+
+/** Newest first; a run with the same findings as a later one folds under it. */
+function RunList({ runs, onShow }: { runs: Run[]; onShow: (seq: number) => void }) {
+  const leads = runs.filter((r) => r.sameAs === undefined).reverse();
+  return (
+    <ul className="space-y-2">
+      {leads.map((lead, index) => (
+        <RunItem
+          key={lead.key}
+          run={lead}
+          repeats={runs.filter((r) => r.sameAs === lead.ordinal)}
+          defaultOpen={index === 0}
+          onShow={onShow}
+        />
+      ))}
+    </ul>
+  );
+}
+
+function RunItem({
+  run,
+  repeats,
+  defaultOpen,
+  onShow,
+}: {
+  run: Run;
+  repeats: Run[];
+  defaultOpen: boolean;
+  onShow: (seq: number) => void;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const [showRepeats, setShowRepeats] = useState(false);
+  return (
+    <li>
+      <Collapsible open={open} onOpenChange={setOpen}>
+        <CollapsibleTrigger asChild>
+          <button className="flex w-full flex-wrap items-baseline gap-x-2 text-left text-xs text-slate-500 hover:text-slate-800">
+            {open ? <ChevronDown className="size-3.5 self-center" /> : <ChevronRight className="size-3.5 self-center" />}
+            <span className="font-mono font-medium text-slate-800">#{run.ordinal}</span>
+            <span>{formatTime(run.startedAt)}</span>
+            <span>{runMeta(run)}</span>
+          </button>
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <div className="mt-1.5 ml-5">
+            <RunBody run={run} onShow={onShow} />
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
+      {repeats.length > 0 && (
+        <div className="mt-1 text-xs text-slate-500">
+          <button
+            className="flex items-baseline gap-x-2 hover:text-slate-800"
+            onClick={() => setShowRepeats((v) => !v)}
+          >
+            {showRepeats ? <ChevronDown className="size-3.5 self-center" /> : <ChevronRight className="size-3.5 self-center" />}
+            <span className="font-mono font-medium text-slate-700">{runLabel(repeats.map((r) => r.ordinal))}</span>
+            <span>
+              same as #{run.ordinal}
+              {repeats.length > 1 && ` (${plural(repeats.length, 'run')})`}
+            </span>
+          </button>
+          {showRepeats && (
+            <ul className="mt-1 ml-5 space-y-0.5">
+              {[...repeats].reverse().map((r) => (
+                <li key={r.key} className="flex flex-wrap items-center gap-x-2">
+                  <span className="font-mono">#{r.ordinal}</span>
+                  <span>{formatTime(r.startedAt)}</span>
+                  <span>{runMeta(r)}</span>
+                  <button className="text-sky-700 hover:underline" onClick={() => onShow(r.seq)}>
+                    show in log
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </li>
+  );
+}
+
+function RunBody({ run, onShow }: { run: Run; onShow: (seq: number) => void }) {
+  return (
+    <div className="space-y-2">
+      {run.summary.length > 0 && (
+        <div className="space-y-0.5 font-mono text-xs break-words text-slate-500">
+          {run.summary.map((line) => (
+            <div key={line}>{line}</div>
+          ))}
+        </div>
+      )}
+      {run.outcome === 'interrupted' && (
+        <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+          <span>Stopped before it finished: a service restart, a lost lease or Cancel. The engine runs the step again.</span>
+          <Button variant="outline" size="sm" className="h-7 gap-1 text-xs" onClick={() => onShow(run.seq)}>
+            <LocateFixed className="size-3.5" /> Show in log
+          </Button>
+        </div>
+      )}
+      {run.problems.length > 0 && (
+        <ul className="divide-y divide-slate-100 rounded-md ring-1 ring-slate-100">
+          {run.problems.map((problem) => (
+            <ProblemItem
+              key={problem.id}
+              problem={problem}
+              defaultOpen={run.problems.length <= 2}
+              onShow={onShow}
+            />
+          ))}
+        </ul>
+      )}
+      {run.notes.map((note) => (
+        <div key={note.seq} className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-600">
+          <Info className="size-3.5 shrink-0 text-sky-700" />
+          <span className="font-medium">{note.title}</span>
+          {note.hint && <span className="text-slate-500">— {note.hint}</span>}
+          {run.problems.length === 0 && (
+            <Button variant="outline" size="sm" className="h-7 gap-1 text-xs" onClick={() => onShow(note.seq)}>
+              <LocateFixed className="size-3.5" /> Show in log
+            </Button>
+          )}
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -207,11 +545,14 @@ function ProblemItem({
   defaultOpen: boolean;
   onShow: (seq: number) => void;
 }) {
-  const meta = kindMeta[problem.kind];
+  const meta = findingMeta(problem);
   const Icon = meta.icon;
   const [open, setOpen] = useState(defaultOpen && problem.snippet.length > 0);
+  const where = problem.packages?.length
+    ? [problem.packages.join(', '), problem.advisory].filter(Boolean).join(' · ')
+    : problem.location;
   return (
-    <li className="px-3 py-2.5">
+    <li className="px-2.5 py-2">
       <Collapsible open={open} onOpenChange={setOpen}>
         <div className="flex items-start gap-2">
           <CollapsibleTrigger asChild disabled={!problem.snippet.length}>
@@ -221,15 +562,10 @@ function ProblemItem({
           </CollapsibleTrigger>
           <Icon className={cn('mt-0.5 size-4 shrink-0', meta.className)} />
           <div className="min-w-0 flex-1">
-            <div className="text-sm font-medium break-words text-slate-900">{problem.title}</div>
+            <div className="text-sm break-words text-slate-900">{problem.title}</div>
             <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
-              <Badge variant="outline" className="font-mono">
-                {problem.step}
-                {problem.attempt > 1 && ` #${problem.attempt}`}
-              </Badge>
               <span>{meta.label}</span>
-              {problem.location && <span className="font-mono text-slate-700">{problem.location}</span>}
-              {problem.command && <span className="truncate font-mono">$ {problem.command}</span>}
+              {where && <span className="font-mono break-words text-slate-700">{where}</span>}
             </div>
           </div>
           <div className="flex shrink-0 gap-1">
@@ -248,9 +584,14 @@ function ProblemItem({
                 <TooltipContent>Copy</TooltipContent>
               </Tooltip>
             )}
-            <Button variant="outline" size="sm" className="h-7 gap-1 text-xs" onClick={() => onShow(problem.seq)}>
-              <LocateFixed className="size-3.5" /> Show in log
-            </Button>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="ghost" size="icon" className="size-7" onClick={() => onShow(problem.seq)}>
+                  <LocateFixed className="size-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Show in log</TooltipContent>
+            </Tooltip>
           </div>
         </div>
         <CollapsibleContent>
@@ -271,9 +612,10 @@ function ProblemItem({
 // Log tree
 
 function lineTone(text: string, stream?: LogLine['stream']): string {
-  if (/^\s*(error(\[\w+\])?:|FAIL |Error:|Caused by:|thread '.*' panicked|::error::)/.test(text) || /^make.*\*\*\*/.test(text))
+  if (/^\s*(error(\[[\w-]+\])?:|FAIL |Error:|Caused by:|thread '.*' panicked|::error::)/.test(text) || /^make.*\*\*\*/.test(text))
     return 'text-rose-300';
-  if (/^\s*warning(\[\w+\])?:/.test(text)) return 'text-amber-300';
+  if (/^\s*warning(\[[\w-]+\])?:/.test(text)) return 'text-amber-300';
+  if (stream === 'info' && SKIPPED.test(text)) return 'text-slate-500 italic';
   if (stream === 'info') return 'text-sky-300';
   if (stream === 'stderr') return 'text-slate-400';
   return 'text-slate-200';

@@ -130,7 +130,7 @@ export function RunPage({ id, steps }: { id: string; steps: string[] }) {
         <Facts facts={facts} />
       </aside>
 
-      <LogViewer runId={id} log={log} steps={steps} failed={run.progress.state.kind === 'failed'} />
+      <LogViewer runId={id} log={log} steps={steps} state={run.progress.state} />
     </div>
   );
 }
