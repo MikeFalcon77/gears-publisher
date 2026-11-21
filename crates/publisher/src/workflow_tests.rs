@@ -190,6 +190,7 @@ fn env<'a>(cmd: &'a Cmd, key: &str) -> Option<&'a str> {
 fn release_exec() -> FakeExec {
     FakeExec::default()
         .on("rev-parse HEAD", |_, _| ok("abc123\n"))
+        .on("rev-parse origin/main", |_, _| ok("abc123\n"))
         .on("gh auth token", |_, _| ok("gho_test_token\n"))
         .on("release-plz release-pr", |_, _| ok(RELEASE_PR))
         .on("gh pr view 7", |_, n| {
@@ -335,6 +336,7 @@ async fn collect_recovers_earlier_attempts_when_a_retry_succeeded() {
 #[tokio::test]
 async fn nothing_to_release_skips_the_rest() {
     let exec = FakeExec::default()
+        .on("rev-parse origin/main", |_, _| ok("abc123\n"))
         .on("gh auth token", |_, _| ok("gho_x_token\n"))
         .on("release-plz release-pr", |_, _| ok(r#"{"prs":[]}"#))
         .on("release_retry.py collect", |cmd, _| {
@@ -432,6 +434,8 @@ async fn publish_gives_up_after_the_configured_failures() {
 #[tokio::test]
 async fn a_dry_run_ends_at_the_first_unpublished_dependency() {
     let exec = FakeExec::default()
+        .on("rev-parse HEAD", |_, _| ok("abc123\n"))
+        .on("rev-parse origin/main", |_, _| ok("abc123\n"))
         .on("gh auth token", |_, _| ok("gho_test_token\n"))
         // git reads gears-rust with the token as an extra header, not anonymously.
         .on("fetch origin", |cmd, _| {
@@ -538,4 +542,36 @@ fn previous_version_is_the_highest_below_current() {
     );
     assert_eq!(previous_version(&versions, "0.1.0"), None);
     assert_eq!(previous_version(&versions, "not-semver"), None);
+}
+
+#[tokio::test]
+async fn checks_follow_main_when_it_moves_before_the_release_pr() {
+    // The first `make fmt` is killed (a restart); main gets a fix meanwhile.
+    let exec = release_exec()
+        .on("make fmt", |_, n| {
+            if n == 1 {
+                CmdOutput {
+                    code: None,
+                    ..ok("")
+                }
+            } else {
+                ok("")
+            }
+        })
+        .on("rev-parse origin/main", |_, n| {
+            ok(if n == 1 { "abc123\n" } else { "fix789\n" })
+        });
+    let exec = FakeExec {
+        rules: exec.rules.into_iter().rev().collect(),
+        ..FakeExec::default()
+    };
+    let h = harness(exec, published(), &fast());
+    let run = TestRuntime::new()
+        .run(&h.workflow, ReleaseInput { dry_run: true })
+        .await
+        .unwrap();
+    assert_eq!(run.attempts("checks"), 2);
+    let state = run.into_output().unwrap();
+    assert_eq!(state.main_sha.as_deref(), Some("fix789"));
+    assert!(h.exec.calls_matching("checkout --force -B work fix789") >= 1);
 }

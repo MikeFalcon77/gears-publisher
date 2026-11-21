@@ -617,7 +617,8 @@ async fn prepare(deps: Arc<Deps>, scope: StepScope, input: ReleaseInput) -> Step
 }
 
 /// The configured check commands (gears-rust's CI). A failure stops the run until Retry.
-async fn checks(deps: Arc<Deps>, scope: StepScope, state: ReleaseState) -> StepResult {
+async fn checks(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState) -> StepResult {
+    follow_main(&deps, &scope, &mut state).await?;
     deps.ensure_tree(&scope, &state, Tree::Main).await?;
     for check in &deps.config.checks {
         let mut words = check.split_whitespace();
@@ -643,14 +644,48 @@ async fn checks(deps: Arc<Deps>, scope: StepScope, state: ReleaseState) -> StepR
         if !out.success() {
             scope
                 .info(format!(
-                    "`{check}` failed; fix main and start a new release \
-                     (Retry checks the same commit again)"
+                    "`{check}` failed; fix main, then press Retry: it checks the latest main"
                 ))
                 .await;
             return Err(ActivityError::permanent("checks_failed"));
         }
     }
     Ok(state)
+}
+
+/// Moves the run to the current `origin/main`. Until the release PR is opened nothing
+/// is tied to a commit, so a Retry after a fix in main checks that fix; with no new
+/// commits (a flaky test) it checks the same one again.
+async fn follow_main(
+    deps: &Deps,
+    scope: &StepScope,
+    state: &mut ReleaseState,
+) -> Result<(), ActivityError> {
+    deps.fetch_tags(scope).await?;
+    let latest = deps
+        .run_ok(
+            scope,
+            deps.git().args(["rev-parse", "origin/main"]).capture(),
+            ActivityError::retryable,
+            "git_failed",
+        )
+        .await?
+        .stdout
+        .trim()
+        .to_owned();
+    if latest.is_empty() {
+        return Err(ActivityError::retryable("git_failed"));
+    }
+    if state.main_sha.as_deref() != Some(latest.as_str()) {
+        scope
+            .info(format!(
+                "main moved: {} → {latest}; checking {latest}",
+                state.main_sha.as_deref().unwrap_or("none")
+            ))
+            .await;
+        state.main_sha = Some(latest);
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]

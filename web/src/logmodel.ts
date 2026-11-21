@@ -48,6 +48,8 @@ export interface ReleaseAttempt {
   by?: string;
   /** Who pressed Cancel during it. */
   cancelledBy?: string;
+  /** The main commit its checks ran on (`main is at` / `main moved` notes). */
+  mainSha?: string;
   startedAt: string;
   endedAt: string;
   sections: Section[];
@@ -57,6 +59,8 @@ export interface ReleaseAttempt {
 const CONTROL = 'control';
 const STARTED = /^(?:dry run|release) started by (.+)$/;
 const REQUESTED = /^(retry|resume|cancel) requested by (.+)$/;
+/** workflow.rs: `prepare` and `checks` name the main commit the run is on. */
+const MAIN_AT = /^main (?:is at|moved: \S+ → \S+; checking) ([0-9a-f]{7,40})$/;
 /** The engine refused a Retry/Resume that was already noted (service.rs). */
 const REJECTED = /^(retry|resume) rejected: /;
 
@@ -81,6 +85,10 @@ export class LogModel {
   append(line: LogLine): void {
     const release = this.release(line);
     release.endedAt = line.ts;
+    if (line.stream === 'info') {
+      const main = MAIN_AT.exec(line.line);
+      if (main) release.mainSha = main[1];
+    }
     // Control notes of each attempt form their own section; a step attempt never spans two.
     const key = line.step === CONTROL ? `${CONTROL}@${release.number}` : `${line.step}#${line.attempt}`;
     let section = this.byKey.get(key);
@@ -155,6 +163,8 @@ export class LogModel {
         number: this.attempts.length + 1,
         trigger,
         by,
+        // Until its checks say otherwise, an attempt is on the commit the last one was.
+        mainSha: this.attempts[this.attempts.length - 1]?.mainSha,
         startedAt: line.ts,
         endedAt: line.ts,
         sections: [],

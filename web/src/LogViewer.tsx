@@ -237,6 +237,11 @@ function AttemptList({
                   {formatTime(a.startedAt)}
                   {a.by && ` · ${a.by.split('@')[0]}`}
                 </span>
+                {a.mainSha && (
+                  <span className="text-slate-500" title={a.mainSha}>
+                    main <span className="font-mono">{a.mainSha.slice(0, 7)}</span>
+                  </span>
+                )}
                 <span className="ml-auto flex items-center gap-2">
                   {latest ? <StatusBadge tone={tone(state)}>{statusLabel(state)}</StatusBadge> : <AttemptEnd attempt={a} />}
                   <span className="text-slate-500 tabular-nums">{formatDuration(a.startedAt, a.endedAt)}</span>

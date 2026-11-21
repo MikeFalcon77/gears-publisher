@@ -191,9 +191,9 @@ function failureGuidance(step: string, code: string, facts: ReleaseFacts): Guida
         kind: 'action',
         title: 'A CI check failed',
         detail:
-          'See Problems. If main needs a fix, merge it and start a new release: Retry checks the same commit again. ' +
-          'Press Retry only for a flaky test or a problem on the host.',
-        button: 'new_release',
+          'See Problems. Merge the fix into main, then press Retry: it checks the latest main. ' +
+          'For a flaky test, Retry with no new commits checks the same one again.',
+        button: 'retry',
       };
     case 'pr_closed':
       return {

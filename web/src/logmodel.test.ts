@@ -352,6 +352,19 @@ describe('release attempts', () => {
     expect(attemptOutcome(m.attempts[0])).toEqual({ step: 'checks', error: 'checks_failed', cancelled: false });
   });
 
+  it('records the main commit each attempt checked', () => {
+    const m = model([
+      ...lines('prepare', 1, [['info', 'main is at 45f40590b262d79b8e59aec8eb7a62098d6d7ee9']]),
+      ...clippyFails(1),
+      ...lines('control', 0, [['info', 'retry requested by b@example.com']]),
+      ...lines('checks', 2, [['info', 'main moved: 45f40590b262d79b8e59aec8eb7a62098d6d7ee9 → a4c53672c12d830f6afbd1819fcf644ae2543b0a; checking a4c53672c12d830f6afbd1819fcf644ae2543b0a']]),
+    ]);
+    expect(m.attempts.map((a) => a.mainSha?.slice(0, 7))).toEqual(['45f4059', 'a4c5367']);
+    // A Retry with no new commits stays on the commit before it.
+    m.append(lines('control', 0, [['info', 'retry requested by b@example.com']])[0]);
+    expect(m.attempts[2].mainSha?.slice(0, 7)).toBe('a4c5367');
+  });
+
   it('folds a Retry the engine refused back into the attempt before it', () => {
     const m = model([
       ...lines('control', 0, [['info', 'release started by a@example.com']]),

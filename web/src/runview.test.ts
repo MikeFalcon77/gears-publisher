@@ -125,12 +125,12 @@ describe('guidance', () => {
     expect(next(d).kind).toBe('wait');
   });
 
-  it('sends failed checks to a new release, not Retry', () => {
+  it('sends failed checks to Retry, which checks the latest main', () => {
     const d = run({ kind: 'failed', error: 'checks_failed', completed_at: done }, [
       ok('prepare', 0),
       { id: 'checks', stage: 1, state: { kind: 'failed', error: 'checks_failed', completed_at: done }, attempts: 1 },
     ]);
-    expect(next(d)).toMatchObject({ kind: 'action', button: 'new_release' });
+    expect(next(d)).toMatchObject({ kind: 'action', button: 'retry' });
   });
 
   it('points host problems at the host', () => {
