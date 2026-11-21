@@ -266,14 +266,34 @@ describe('groupProblems', () => {
     expect(commands.find((c) => c.command === 'git fetch origin')!.status).toBe('recovered');
   });
 
-  it('reports a step that failed outside any command', () => {
-    const verify = lines('verify', 1, [
-      ['info', 'verify: attempt 1 started'],
-      ['info', 'verify: failed (verify_mismatch)'],
-    ]);
-    const [command] = groupProblems(buildSections(verify));
+  it('reports a step that failed outside any command, as the server words it', () => {
+    // The wrapper writes `, will retry` after every retryable failure, the last one too.
+    const verify = (attempt: number) =>
+      lines('verify', attempt, [
+        ['info', `verify: attempt ${attempt} started`],
+        ['info', 'verify: failed (verify_mismatch), will retry'],
+      ]);
+    const [command] = groupProblems(buildSections([...verify(1), ...verify(2)]));
     expect(command).toMatchObject({ step: 'verify', command: null, status: 'failed' });
-    expect(command.runs[0].notes[0]).toMatchObject({ code: 'verify_mismatch', hint: 'crates.io or tags do not match the manifests' });
+    expect(command.runs.map((r) => r.sameAs)).toEqual([2, undefined]);
+    expect(command.runs[1].notes[0]).toMatchObject({ code: 'verify_mismatch', hint: 'crates.io or tags do not match the manifests' });
+
+    const failedFirst = verify(1);
+    const later = lines('verify', 3, [['info', 'verify: done']]);
+    expect(groupProblems(buildSections([...failedFirst, ...later]))[0].status).toBe('recovered');
+  });
+
+  it('keeps runs apart when the same error is in another place', () => {
+    const clippy = (attempt: number, file: string) =>
+      lines('checks', attempt, [
+        ['cmd', '$ make clippy'],
+        ['stderr', 'error[E0308]: mismatched types'],
+        ['stderr', `  --> ${file}:1:1`],
+        ['stderr', ''],
+        ['info', 'exit 2'],
+      ]);
+    const [command] = groupProblems(buildSections([...clippy(1, 'a.rs'), ...clippy(2, 'b.rs')]));
+    expect(command.runs.map((r) => r.sameAs)).toEqual([undefined, undefined]);
   });
 
   it('falls back to the tail of an unrecognised failure', () => {
@@ -330,6 +350,32 @@ describe('release attempts', () => {
     ]);
     expect(m.sections.map((s) => s.release)).toEqual([1, 1, 1, 2, 2]);
     expect(attemptOutcome(m.attempts[0])).toEqual({ step: 'checks', error: 'checks_failed', cancelled: false });
+  });
+
+  it('folds a Retry the engine refused back into the attempt before it', () => {
+    const m = model([
+      ...lines('control', 0, [['info', 'release started by a@example.com']]),
+      ...clippyFails(1),
+      ...lines('control', 0, [
+        ['info', 'retry requested by b@example.com'],
+        ['info', 'retry rejected: run is not failed'],
+      ]),
+    ]);
+    expect(m.attempts).toHaveLength(1);
+    expect(m.sections.map((s) => s.key)).toEqual(['control@1', 'checks#1']);
+    expect(m.sections[0].items).toHaveLength(3);
+    // A later Retry that goes through is attempt #2 again.
+    m.append(lines('control', 0, [['info', 'retry requested by b@example.com']])[0]);
+    expect(m.attempts.map((a) => a.number)).toEqual([1, 2]);
+  });
+
+  it('reports the last failure of an attempt, unless the step later finished', () => {
+    const m = model([
+      ...lines('prepare', 1, [['info', 'prepare: failed (git_fetch_failed), will retry']]),
+      ...lines('prepare', 2, [['info', 'prepare: done']]),
+      ...lines('checks', 1, [['info', 'checks: attempt 1 started']]),
+    ]);
+    expect(attemptOutcome(m.attempts[0])).toEqual({ step: 'checks', error: undefined, cancelled: false });
   });
 
   it('keeps one attempt when nothing was retried, and notes a Cancel', () => {

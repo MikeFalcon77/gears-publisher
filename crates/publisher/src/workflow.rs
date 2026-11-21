@@ -21,7 +21,7 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -90,6 +90,14 @@ pub struct VerifyReport {
     pub missing_tags: Vec<String>,
     /// Packages whose index lookup failed.
     pub errors: Vec<String>,
+    /// Package name → the highest crates.io version below the one checked: what a
+    /// release replaced. Absent for a crate's first version.
+    #[serde(default)]
+    pub previous: BTreeMap<String, String>,
+    /// Packages released as tags only (`git_only` in release-plz.toml): not looked up
+    /// on crates.io.
+    #[serde(default)]
+    pub git_only: Vec<String>,
 }
 
 impl VerifyReport {
@@ -1190,9 +1198,19 @@ async fn verify(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState) -> S
 
     let mut report = VerifyReport {
         checked: packages.len(),
+        git_only: packages
+            .iter()
+            .filter(|p| !p.crates_io)
+            .map(|p| p.name.clone())
+            .collect(),
         ..VerifyReport::default()
     };
     for (versions, p) in lookups {
+        if let Ok(v) = &versions
+            && let Some(previous) = previous_version(v, &p.version)
+        {
+            report.previous.insert(p.name.clone(), previous);
+        }
         match versions {
             Ok(v) if v.contains(&p.version) => {}
             Ok(_) => report
@@ -1227,6 +1245,17 @@ async fn verify(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState) -> S
         )
         .await;
     Err(ActivityError::retryable("verify_mismatch"))
+}
+
+/// The highest of `versions` below `current` (semver order; unparsable ones skipped).
+fn previous_version(versions: &[String], current: &str) -> Option<String> {
+    let current = semver::Version::parse(current).ok()?;
+    versions
+        .iter()
+        .filter_map(|v| semver::Version::parse(v).ok())
+        .filter(|v| *v < current)
+        .max()
+        .map(|v| v.to_string())
 }
 
 async fn lookup_versions(

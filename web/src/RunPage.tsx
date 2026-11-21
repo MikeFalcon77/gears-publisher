@@ -10,6 +10,7 @@ import {
   formatDuration,
   formatTime,
   guidance,
+  releaseReport,
   statusLabel,
   type Guidance,
   stepViews,
@@ -19,6 +20,7 @@ import {
 import type { LogLine, ReleaseFacts, RunDetail } from './types';
 import { Badge, Button, ErrorNote, StepIcon } from './ui';
 import { LogViewer } from './LogViewer';
+import { ReleaseReport } from './ReleaseReport';
 import { LogModel } from './logmodel';
 import { Quip } from './irony';
 
@@ -55,6 +57,9 @@ export function RunPage({ id, steps }: { id: string; steps: string[] }) {
   const allowed = actions(run.progress.state);
   const facts = run.record?.facts ?? {};
   const next = guidance(views, run);
+  // A real release that published something gets a report; a dry run keeps its facts.
+  const reported = !run.record?.dry_run && releaseReport(facts).rows.length > 0;
+  const report = reported ? <ReleaseReport run={run} /> : undefined;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4 lg:flex-row">
@@ -127,10 +132,10 @@ export function RunPage({ id, steps }: { id: string; steps: string[] }) {
           </ol>
         </section>
 
-        <Facts facts={facts} />
+        <Facts facts={facts} reported={reported} />
       </aside>
 
-      <LogViewer runId={id} log={log} steps={steps} state={run.progress.state} />
+      <LogViewer runId={id} log={log} steps={steps} state={run.progress.state} report={report} />
     </div>
   );
 }
@@ -256,9 +261,10 @@ function StepRow({
   );
 }
 
-function Facts({ facts }: { facts: ReleaseFacts }) {
-  const releases = facts.releases ?? facts.publish?.releases;
-  const verify = facts.verify;
+/** `reported`: the released crates and their verification are on the Report tab. */
+function Facts({ facts, reported }: { facts: ReleaseFacts; reported: boolean }) {
+  const releases = reported ? undefined : (facts.releases ?? facts.publish?.releases);
+  const verify = reported ? undefined : facts.verify;
   if (!facts.pr && !facts.pre_released?.length && !facts.packages?.length && !releases && !verify && !facts.update_diff && !facts.nothing_to_release)
     return null;
   return (
@@ -363,7 +369,9 @@ function useLog(id: string, onRun: () => void): Log {
           lastSeq.current = line.seq;
           lines.current.push(line);
           if (lines.current.length > MAX_LINES + DROP_LINES) {
-            lines.current = lines.current.slice(DROP_LINES);
+            // Control notes stay: they number the release's attempts and say who started them.
+            const control = lines.current.slice(0, DROP_LINES).filter((l) => l.step === 'control');
+            lines.current = [...control, ...lines.current.slice(DROP_LINES)];
             model.current = new LogModel();
             for (const kept of lines.current) model.current.append(kept);
           } else {

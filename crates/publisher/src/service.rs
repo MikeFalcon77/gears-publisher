@@ -236,10 +236,18 @@ impl Service {
         let _guard = self.start_lock.lock().await;
         self.ensure_exclusive(Some(id)).await?;
         let epoch = self.progress(id).await?.epoch;
-        self.client
-            .resume(&self.service_ctx, RunId(id), ContinueOptions::new(epoch))
-            .await?;
+        // Noted before the engine is told: the worker's first lines of the new attempt
+        // must come after the note that opens it in the UI.
         self.after_command(person, id, "resume").await;
+        if let Err(error) = self
+            .client
+            .resume(&self.service_ctx, RunId(id), ContinueOptions::new(epoch))
+            .await
+        {
+            self.control_note(id, format!("resume rejected: {error}"))
+                .await;
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -247,22 +255,36 @@ impl Service {
         let _guard = self.start_lock.lock().await;
         self.ensure_exclusive(Some(id)).await?;
         let epoch = self.progress(id).await?.epoch;
-        self.client
-            .retry(&self.service_ctx, RunId(id), ContinueOptions::new(epoch))
-            .await?;
+        // Noted before the engine is told: the worker's first lines of the new attempt
+        // must come after the note that opens it in the UI.
         self.after_command(person, id, "retry").await;
+        if let Err(error) = self
+            .client
+            .retry(&self.service_ctx, RunId(id), ContinueOptions::new(epoch))
+            .await
+        {
+            self.control_note(id, format!("retry rejected: {error}"))
+                .await;
+            return Err(error.into());
+        }
         Ok(())
     }
 
     async fn after_command(&self, person: &Person, id: Uuid, command: &str) {
         tracing::info!(run_id = %id, by = %person.email, command, "run command");
+        self.control_note(id, format!("{command} requested by {}", person.email))
+            .await;
+    }
+
+    /// A line on the `control` pseudo-step; the UI splits a run into attempts on them.
+    async fn control_note(&self, id: Uuid, line: String) {
         self.store
             .log(NewLine {
                 run_id: id,
                 step: "control".into(),
                 attempt: 0,
                 stream: "info",
-                line: format!("{command} requested by {}", person.email),
+                line,
             })
             .await;
         self.store.notify(id);

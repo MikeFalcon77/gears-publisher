@@ -129,6 +129,9 @@ export function currentStep(views: StepView[]): StepView | undefined {
 export function summaryTitle(run: RunSummary): string {
   const facts = run.record?.facts;
   if (facts?.nothing_to_release) return 'Nothing to release';
+  const released = facts?.releases ?? facts?.publish?.releases;
+  if (run.progress.state.kind === 'succeeded' && !run.record?.dry_run && released?.length)
+    return `Released ${released.length} crate${released.length === 1 ? '' : 's'}`;
   if (facts?.pr) return `Release PR #${facts.pr.number}`;
   return run.record?.dry_run ? 'Dry run' : 'Release';
 }
@@ -226,7 +229,7 @@ function failureGuidance(step: string, code: string, facts: ReleaseFacts): Guida
       return {
         kind: 'action',
         title: 'crates.io or the tags do not match the release',
-        detail: 'See the differences under Verified. Press Retry to check again once crates.io has caught up.',
+        detail: 'The Report tab shows which crates differ. Press Retry to check again once crates.io has caught up.',
         button: 'retry',
       };
     default:
@@ -317,4 +320,87 @@ export function guidance(views: StepView[], detail: RunSummary): Guidance {
     };
   }
   return { kind: 'wait', title: current ? (STEP_DOING[current.id] ?? `Running ${current.id}`) : 'Running' };
+}
+
+/** What `verify` found wrong with one released crate. */
+export type VerifyIssue = 'not_on_crates_io' | 'no_tag' | 'lookup_error';
+
+export interface ReportRow {
+  name: string;
+  version: string;
+  /** The crates.io version it replaced. */
+  previous?: string;
+  /** Whether `previous` was looked up: false before verify and for runs older than it. */
+  previousKnown: boolean;
+  /** Released as a tag only (`git_only`), not to crates.io. */
+  gitOnly: boolean;
+  tag: string;
+  crateUrl?: string;
+  tagUrl?: string;
+  compareUrl?: string;
+  /** `false` until verify has run. */
+  verified: boolean;
+  issues: VerifyIssue[];
+}
+
+export interface ReleaseReport {
+  rows: ReportRow[];
+  /** Differences `verify` found outside the released crates. */
+  other: string[];
+}
+
+/** The release PR's repository (`https://github.com/o/r`), for tag and compare links. */
+function repository(facts: ReleaseFacts): string | undefined {
+  return /^(https:\/\/github\.com\/[^/]+\/[^/]+)\/pull\/\d+\/?$/.exec(facts.pr?.url ?? '')?.[1];
+}
+
+/** What a release published, one row per crate, with what `verify` found for it. */
+export function releaseReport(facts: ReleaseFacts): ReleaseReport {
+  const releases = facts.releases ?? facts.publish?.releases ?? [];
+  const verify = facts.verify;
+  const repo = repository(facts);
+  const gitOnly = new Set(verify?.git_only ?? []);
+  const accounted = new Set<string>();
+  const rows = releases
+    .map((r): ReportRow => {
+      const missing = `${r.package_name} ${r.version}`;
+      const error = verify?.errors.find((e) => e.startsWith(`${missing}:`));
+      const issues: VerifyIssue[] = [];
+      if (verify?.missing_on_crates_io.includes(missing)) issues.push('not_on_crates_io');
+      if (verify?.missing_tags.includes(r.tag)) issues.push('no_tag');
+      if (error) issues.push('lookup_error');
+      accounted.add(missing).add(r.tag);
+      if (error) accounted.add(error);
+      const tagOnly = gitOnly.has(r.package_name);
+      // Runs verified before `previous` existed have none: unknown, not a first release.
+      const previousKnown = verify?.previous !== undefined && !tagOnly && !error;
+      const previous = verify?.previous?.[r.package_name];
+      // Tags are `name-vX.Y.Z`; the previous release's tag differs only in the version.
+      const previousTag =
+        previous && r.tag.endsWith(`v${r.version}`) ? `${r.tag.slice(0, -r.version.length)}${previous}` : undefined;
+      return {
+        name: r.package_name,
+        version: r.version,
+        previous,
+        previousKnown,
+        gitOnly: tagOnly,
+        tag: r.tag,
+        crateUrl: tagOnly
+          ? undefined
+          : `https://crates.io/crates/${encodeURIComponent(r.package_name)}/${encodeURIComponent(r.version)}`,
+        tagUrl: repo && `${repo}/tree/${encodeURIComponent(r.tag)}`,
+        compareUrl: repo && previousTag && `${repo}/compare/${encodeURIComponent(previousTag)}...${encodeURIComponent(r.tag)}`,
+        verified: verify !== undefined && verify !== null,
+        issues,
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const other = verify
+    ? [
+        ...verify.missing_on_crates_io.filter((x) => !accounted.has(x)).map((x) => `not on crates.io: ${x}`),
+        ...verify.missing_tags.filter((x) => !accounted.has(x)).map((x) => `no tag: ${x}`),
+        ...verify.errors.filter((x) => !accounted.has(x)).map((x) => `lookup error: ${x}`),
+      ]
+    : [];
+  return { rows, other };
 }

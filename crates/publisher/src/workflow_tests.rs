@@ -241,6 +241,13 @@ async fn a_release_goes_through_rate_limits_to_verification() {
     let verify = state.verify.unwrap();
     assert!(verify.clean(), "{verify:?}");
     assert_eq!(verify.checked, 3);
+    // cf-a 0.2.0 replaced 0.1.0; cf-b 1.0.1 is its first version.
+    assert_eq!(
+        verify.previous,
+        BTreeMap::from([("cf-a".to_owned(), "0.1.0".to_owned())])
+    );
+    // `app` has `publish = []`: released as a tag only.
+    assert_eq!(verify.git_only, ["app"]);
     assert!(state.skipped.is_empty());
     assert_eq!(state.pre_released, Some(Vec::new()));
     // Before the retry: release_retry.py wait (API budget, tags), as in release-plz.yml.
@@ -516,4 +523,19 @@ fn env_files_are_parsed() {
         Some("abc")
     );
     assert_eq!(env_file_value(text, "MISSING"), None);
+}
+
+#[test]
+fn previous_version_is_the_highest_below_current() {
+    let versions = ["0.1.0", "0.10.0", "0.9.0", "0.11.0-rc.1", "0.11.0", "junk"].map(String::from);
+    assert_eq!(
+        previous_version(&versions, "0.11.0").as_deref(),
+        Some("0.11.0-rc.1")
+    );
+    assert_eq!(
+        previous_version(&versions, "0.10.1").as_deref(),
+        Some("0.10.0")
+    );
+    assert_eq!(previous_version(&versions, "0.1.0"), None);
+    assert_eq!(previous_version(&versions, "not-semver"), None);
 }

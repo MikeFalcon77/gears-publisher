@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import {
   AlertTriangle,
@@ -16,6 +16,7 @@ import {
   Loader2,
   RotateCw,
   LocateFixed,
+  PackageCheck,
   Search,
   ShieldAlert,
   X,
@@ -55,6 +56,8 @@ import type { LogLine, RunState } from './types';
 
 const ROW = 20;
 
+type Tab = 'report' | 'problems' | 'log';
+
 export interface LogSource {
   lines: LogLine[];
   model: LogModel;
@@ -69,12 +72,15 @@ export function LogViewer({
   log,
   steps,
   state,
+  report,
 }: {
   runId: string;
   log: LogSource;
   steps: string[];
   /** The release's state, shown for its latest attempt. */
   state: RunState;
+  /** What the release produced; adds a Report tab, opened when the release succeeds. */
+  report?: ReactNode;
 }) {
   // The model grows in place; `version` changes whenever it does. New arrays make the
   // memoised rows below recompute.
@@ -91,18 +97,26 @@ export function LogViewer({
   const commands = useMemo(() => groupProblems(visible), [visible]);
   // Commands still failing; interrupted and recovered ones do not count.
   const failing = commands.filter((c) => c.status === 'failed' || c.status === 'retrying').length;
-  const [tab, setTab] = useState<'problems' | 'log'>('log');
+  // The report answers both "what was released" and "what does verify say is missing".
+  const reportFirst =
+    report !== undefined && (state.kind === 'succeeded' || ('error' in state && state.error === 'verify_mismatch'));
+  const [tab, setTab] = useState<Tab>(() => (reportFirst ? 'report' : 'log'));
   const [jump, setJump] = useState<{ seq: number; at: number } | null>(null);
 
-  // A failed run opens on what broke, once.
+  // A failed run opens on what broke, a successful one on what it released; once, so
+  // the viewer's own choice of tab sticks.
   const switched = useRef(false);
   const failed = state.kind === 'failed';
   useEffect(() => {
-    if (!switched.current && failed && failing) {
+    if (switched.current) return;
+    if (reportFirst) {
+      switched.current = true;
+      setTab('report');
+    } else if (failed && failing) {
       switched.current = true;
       setTab('problems');
     }
-  }, [failed, failing]);
+  }, [failed, failing, reportFirst]);
 
   const showInLog = (seq: number) => {
     setTab('log');
@@ -112,7 +126,7 @@ export function LogViewer({
   return (
     <Tabs
       value={tab}
-      onValueChange={(v) => setTab(v as 'problems' | 'log')}
+      onValueChange={(v) => setTab(v as Tab)}
       className="flex min-h-[60vh] flex-1 flex-col gap-0 overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200 lg:min-h-0"
     >
       {attempts.length > 1 && (
@@ -120,6 +134,11 @@ export function LogViewer({
       )}
       <div className="flex items-center gap-2 border-b border-slate-200 px-3 py-2">
         <TabsList>
+          {report !== undefined && (
+            <TabsTrigger value="report" className="gap-1.5">
+              <PackageCheck className="size-4" /> Report
+            </TabsTrigger>
+          )}
           <TabsTrigger value="problems" className="gap-1.5">
             <Bug className="size-4" /> Problems
             {failing > 0 && (
@@ -145,6 +164,11 @@ export function LogViewer({
         </span>
         <DownloadButton runId={runId} />
       </div>
+      {report !== undefined && (
+        <TabsContent value="report" className="min-h-0 flex-1 overflow-auto">
+          {report}
+        </TabsContent>
+      )}
       <TabsContent value="problems" className="min-h-0 flex-1 overflow-auto">
         {/* Keyed by attempt: what is open in one attempt means nothing in another. */}
         <ProblemList key={attempt} commands={commands} onShow={showInLog} empty={log.lines.length === 0} />

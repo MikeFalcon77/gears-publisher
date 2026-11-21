@@ -3919,6 +3919,7 @@ dependencies = [
  "sea-orm",
  "sea-orm-migration",
  "secrecy",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

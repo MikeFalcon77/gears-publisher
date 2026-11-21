@@ -57,6 +57,8 @@ export interface ReleaseAttempt {
 const CONTROL = 'control';
 const STARTED = /^(?:dry run|release) started by (.+)$/;
 const REQUESTED = /^(retry|resume|cancel) requested by (.+)$/;
+/** The engine refused a Retry/Resume that was already noted (service.rs). */
+const REJECTED = /^(retry|resume) rejected: /;
 
 const EXIT = /^exit (\d+|by signal)$/;
 
@@ -124,6 +126,28 @@ export class LogModel {
     section.items.push({ kind: 'note', line });
   }
 
+  /** Folds a refused attempt back into the previous one, its notes with it. */
+  private withdraw(refused: ReleaseAttempt): ReleaseAttempt {
+    this.attempts.pop();
+    const previous = this.attempts[this.attempts.length - 1];
+    previous.endedAt = refused.endedAt;
+    const key = `${CONTROL}@${previous.number}`;
+    for (const section of refused.sections) {
+      this.byKey.delete(section.key);
+      const into = this.byKey.get(key);
+      if (into) {
+        into.items.push(...section.items);
+        this.sections.splice(this.sections.indexOf(section), 1);
+      } else {
+        section.key = key;
+        section.release = previous.number;
+        this.byKey.set(key, section);
+        previous.sections.push(section);
+      }
+    }
+    return previous;
+  }
+
   /** The attempt `line` belongs to; a Retry/Resume note opens a new one. */
   private release(line: LogLine): ReleaseAttempt {
     const open = (trigger: AttemptTrigger, by?: string) => {
@@ -149,6 +173,10 @@ export class LogModel {
     }
     const requested = REQUESTED.exec(line.line);
     if (requested?.[1] === 'retry' || requested?.[1] === 'resume') return open(requested[1], requested[2]);
+    const rejected = REJECTED.exec(line.line);
+    if (rejected && current && this.attempts.length > 1 && current.trigger === rejected[1]) {
+      if (current.sections.every((s) => s.step === CONTROL)) return this.withdraw(current);
+    }
     const attempt = current ?? open('start');
     if (requested?.[1] === 'cancel') attempt.cancelledBy = requested[2];
     return attempt;
@@ -163,6 +191,7 @@ export function attemptOutcome(attempt: ReleaseAttempt): { step?: string; error?
       if (item.kind !== 'note') continue;
       const failed = STEP_FAILED.exec(item.line.line);
       if (failed && !INTERRUPTED_CODES.has(failed[2])) failure = { step: failed[1], error: failed[2] };
+      else if (STEP_DONE.exec(item.line.line)?.[1] === failure.step) failure = {};
     }
   }
   const last = [...attempt.sections].reverse().find((s) => s.step !== CONTROL);
@@ -214,7 +243,10 @@ const ANYHOW = /^Error: (.+)$/;
 const TRACING_ERROR = /^\S*\s*ERROR\s+(.+)$/;
 const GH_ERROR = /^::error::(.+)$/;
 const RATE_LIMIT = /429 Too Many Requests/;
-const STEP_FAILED = /^(\w+): failed \((.+)\)$/;
+// The step wrapper (workflow.rs) writes `, will retry…` after every retryable failure,
+// the last one included.
+const STEP_FAILED = /^(\w+): failed \(([^)]+)\)(?:, will retry.*)?$/;
+const STEP_DONE = /^(\w+): done$/;
 const DENY_SUMMARY = /^(advisories|bans|licenses|sources) (ok|FAILED)(, (advisories|bans|licenses|sources) (ok|FAILED))*$/;
 // cargo-deny's codespan excerpt of the Cargo.lock entry: `272 │ chrono 0.4.45 registry+…`.
 const DENY_PACKAGE = /^\s*\d+\s*│\s*(\S+) (\d\S*) (?:registry|git|path)\+/;
@@ -333,9 +365,12 @@ export function groupProblems(sections: Section[]): CommandProblems[] {
     return found;
   };
 
+  /** Step → seq of its last `done` note: a step failure before it was recovered from. */
+  const done = new Map<string, number>();
   for (const section of sections) {
     let lastFailed: Run | undefined;
     for (const item of section.items) {
+      if (item.kind === 'note' && STEP_DONE.test(item.line.line)) done.set(section.step, item.line.seq);
       if (item.kind === 'command') {
         const target = entry(section.step, item.command);
         const run = commandRun(item, target.runs.length + 1);
@@ -376,8 +411,9 @@ export function groupProblems(sections: Section[]): CommandProblems[] {
     const bad = command.runs.filter((r) => r.outcome === 'failed' || r.outcome === 'interrupted');
     if (!bad.length) continue;
     const last = command.runs[command.runs.length - 1];
+    const recovered = command.command === null && (done.get(command.step) ?? -1) > last.seq;
     command.status =
-      last.outcome === 'ok'
+      last.outcome === 'ok' || recovered
         ? 'recovered'
         : last.outcome === 'running'
           ? 'retrying'
@@ -443,7 +479,14 @@ function foldRepeats(runs: Run[]) {
   const signature = (r: Run) =>
     r.outcome === 'interrupted'
       ? 'interrupted'
-      : [...r.problems.map((p) => `${p.kind}:${p.title}`), ...r.notes.map((n) => `note:${n.code}`)].sort().join('\n');
+      : [
+          ...r.problems.map((p) =>
+            [p.kind, p.title, p.location ?? '', p.advisory ?? '', [...(p.packages ?? [])].sort().join(',')].join(':'),
+          ),
+          ...r.notes.map((n) => `note:${n.code}`),
+        ]
+          .sort()
+          .join('\n');
   for (let i = runs.length - 2; i >= 0; i--) {
     const later = runs[i + 1];
     if (signature(runs[i]) === signature(later)) runs[i].sameAs = later.sameAs ?? later.ordinal;

@@ -85,6 +85,10 @@ export interface ReleaseFacts {
     missing_on_crates_io: string[];
     missing_tags: string[];
     errors: string[];
+    /** Package name → the crates.io version a release replaced. */
+    previous?: Record<string, string>;
+    /** Packages released as tags only, not on crates.io. */
+    git_only?: string[];
   } | null;
   skipped?: string[];
 }
