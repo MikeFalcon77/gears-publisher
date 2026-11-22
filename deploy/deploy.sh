@@ -2,7 +2,8 @@
 # Laptop-side deployment over SSH (root@<ip>).
 #
 #   deploy/deploy.sh provision <ip>            sync sources, install everything (once; idempotent)
-#   deploy/deploy.sh secrets <ip> <env-file>   copy CARGO_REGISTRY_TOKEN from a local .env
+#   deploy/deploy.sh secrets <ip> <env-file>   copy CARGO_REGISTRY_TOKEN (and the optional
+#                                              read-only GITHUB_CI_TOKEN for PR CI) from a local .env
 #   deploy/deploy.sh config <ip>               install config/publisher.yaml (overwrites the allowlist!)
 #   deploy/deploy.sh app <ip>                  sync, build UI and server on the host, restart
 #   deploy/deploy.sh status <ip>               service state and recent log
@@ -48,7 +49,7 @@ case "$cmd" in
   secrets)
     file=${3:?env file with CARGO_REGISTRY_TOKEN}
     # Via stdin: the token never appears in a command line.
-    grep -E '^(export )?CARGO_REGISTRY_TOKEN=' "$file" | sed 's/^export //' \
+    grep -E '^(export )?(CARGO_REGISTRY_TOKEN|GITHUB_CI_TOKEN)=' "$file" | sed 's/^export //' \
       | ssh_ "install -o root -g publisher -m 0640 /dev/stdin /etc/gears-publisher/secrets.env"
     echo "secrets.env updated"
     ;;

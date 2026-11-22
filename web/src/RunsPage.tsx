@@ -11,8 +11,8 @@ import { Quip } from './irony';
 export function RunsPage({ steps }: { steps: string[] }) {
   const client = useQueryClient();
   const runs = useQuery({
-    queryKey: ['runs'],
-    queryFn: () => api<RunSummary[]>('/runs'),
+    queryKey: ['runs', 'release'],
+    queryFn: () => api<RunSummary[]>('/runs?kind=release'),
     refetchInterval: 5000,
   });
   const [dryRun, setDryRun] = useState(true);

@@ -239,7 +239,8 @@ function AttemptList({
                 </span>
                 {a.mainSha && (
                   <span className="text-slate-500" title={a.mainSha}>
-                    main <span className="font-mono">{a.mainSha.slice(0, 7)}</span>
+                    {a.commitLabel === 'merge' ? 'merge' : 'main'}{' '}
+                    <span className="font-mono">{a.mainSha.slice(0, 7)}</span>
                   </span>
                 )}
                 <span className="ml-auto flex items-center gap-2">

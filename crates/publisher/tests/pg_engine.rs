@@ -2,12 +2,13 @@
 //!
 //! `PUBLISHER_TEST_PG_URL=postgres://… cargo test -p publisher --test pg_engine -- --ignored`
 use async_trait::async_trait;
-use publisher::auth::{Person, ServiceAuthorizer, service_context};
-use publisher::crates_io::Registry;
-use publisher::runner::{Cmd, CmdOutput, Exec, ExecError, StepScope};
-use publisher::service::Service;
-use publisher::store::PgStore;
-use publisher::workflow::{self, Deps, ReleaseInput};
+use publisher::domain::access::{Directory, ServiceAuthorizer, service_context};
+use publisher::domain::models::Person;
+use publisher::domain::ports::{Cmd, CmdOutput, Exec, ExecError, Registry, StepScope};
+use publisher::domain::release::{self as workflow, Deps, ReleaseInput};
+use publisher::domain::service::RunService as Service;
+use publisher::domain::steps::BuildSlot;
+use publisher::infra::db::{migrations, repo::PgRunRepository};
 use secrecy::SecretString;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -65,12 +66,14 @@ async fn start(url: &str, queue: &str, work: &std::path::Path, exec: Arc<dyn Exe
     let db = toolkit_db::connect_db(url, toolkit_db::ConnectOpts::default())
         .await
         .unwrap();
-    let mut migrations = publisher::store::migrations::all();
+    let mut migrations = migrations::all();
     migrations.extend(toolkit_durable_execution::migrations());
     toolkit_db::migration_runner::run_migrations_for_gear(&db, "publisher", migrations)
         .await
         .unwrap();
-    let store = Arc::new(PgStore::new(toolkit_db::DBProvider::new(db.clone())));
+    let store = Arc::new(PgRunRepository::new(toolkit_db::DBProvider::new(
+        db.clone(),
+    )));
     let engine = Engine::builder(db, Arc::new(ServiceAuthorizer))
         .mode(ExecutionMode::Worker(QueueConfig::new(
             SecretString::from(url.to_owned()),
@@ -97,6 +100,7 @@ async fn start(url: &str, queue: &str, work: &std::path::Path, exec: Arc<dyn Exe
         exec,
         journal: store.clone(),
         registry: Arc::new(NoRegistry),
+        slot: Arc::new(BuildSlot::default()),
     });
     let service = Arc::new(Service::new(
         engine
@@ -104,8 +108,9 @@ async fn start(url: &str, queue: &str, work: &std::path::Path, exec: Arc<dyn Exe
             .with_poll_interval(Duration::from_millis(100)),
         engine.inspector(),
         store,
-        publisher::auth::Directory::default(),
+        Directory::default(),
         service_context(),
+        None,
     ));
     let registered = engine
         .registry()
@@ -113,7 +118,12 @@ async fn start(url: &str, queue: &str, work: &std::path::Path, exec: Arc<dyn Exe
         .await
         .unwrap();
     let runner = engine.prepare().await.map_err(|e| e.to_string()).unwrap();
-    service.workflow.set(registered.reference).ok().unwrap();
+    service
+        .workflows
+        .release
+        .set(registered.reference)
+        .ok()
+        .unwrap();
     let stop = CancellationToken::new();
     let token = stop.clone();
     let task = tokio::spawn(async move {
@@ -170,14 +180,14 @@ async fn a_run_continues_after_a_restart_in_the_middle_of_a_step() {
     .await;
     let id = first
         .service
-        .start(&person, ReleaseInput { dry_run: false })
+        .start_release(&person, ReleaseInput { dry_run: false })
         .await
         .unwrap();
     // A second start while one is active is refused.
     assert!(
         first
             .service
-            .start(&person, ReleaseInput::default())
+            .start_release(&person, ReleaseInput::default())
             .await
             .is_err()
     );

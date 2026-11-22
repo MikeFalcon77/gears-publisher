@@ -7,6 +7,7 @@
 //! every run as one service identity, and records the human who pressed the button
 //! in its own `publisher_runs` table.
 use crate::config::PublisherConfig;
+use crate::domain::models::Person;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use toolkit_durable_execution::{
@@ -60,13 +61,6 @@ impl Authorizer for ServiceAuthorizer {
             _ => AccessScope::allow_all(),
         })
     }
-}
-
-/// An allowlisted person, as the UI shows them.
-#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
-pub struct Person {
-    pub uid: String,
-    pub email: String,
 }
 
 /// Maps authenticated subject ids back to configured accounts.

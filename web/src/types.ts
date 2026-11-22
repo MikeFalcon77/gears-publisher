@@ -93,21 +93,77 @@ export interface ReleaseFacts {
   skipped?: string[];
 }
 
-export interface RunRecord {
+export interface RunRecord<F = ReleaseFacts> {
   run_id: string;
   started_by: string;
   dry_run: boolean;
   created_at: string;
-  facts: ReleaseFacts;
+  facts: F;
 }
 
-export interface RunSummary {
+export type RunKind = 'release' | 'ci';
+
+export interface RunSummary<F = ReleaseFacts> {
+  /** `null` for a workflow this UI does not know. */
+  kind?: RunKind | null;
   progress: RunProgress;
-  record: RunRecord | null;
+  record: RunRecord<F> | null;
 }
 
-export interface RunDetail extends RunSummary {
+export interface RunDetail<F = ReleaseFacts> extends RunSummary<F> {
   history: RunHistory;
+}
+
+export type JobConclusion = 'success' | 'failure' | 'skipped';
+
+export interface JobResult {
+  id: string;
+  conclusion: JobConclusion;
+  failed_step?: string | null;
+  reason?: string | null;
+}
+
+/** PR CI's state (ci/mod.rs `CiState`); the first facts hold only `pr_number`/`only`. */
+export interface CiFacts {
+  pr_number?: number;
+  pr?: {
+    number: number;
+    title: string;
+    url: string;
+    author: string;
+    head_ref: string;
+    head_sha: string;
+    base_ref: string;
+    cross_repository: boolean;
+  } | null;
+  only?: string[] | null;
+  merge_sha?: string | null;
+  base_sha?: string | null;
+  changed_files?: number;
+  files?: string[];
+  changes?: { filters: Record<string, boolean>; ci_workflow: boolean; fmt_workflow: boolean } | null;
+  rules?: string | null;
+  jobs?: JobResult[];
+  skipped?: string[];
+}
+
+export type CiRun = RunDetail<CiFacts>;
+export type CiSummary = RunSummary<CiFacts>;
+
+export interface CiJob {
+  id: string;
+  name: string;
+  workflow: string;
+  steps: string[];
+  note: string | null;
+}
+
+export interface CiInfo {
+  steps: string[];
+  jobs: CiJob[];
+  repository: string;
+  /** Why PR CI cannot run on this host. */
+  unavailable: string | null;
 }
 
 export interface LogLine {
@@ -123,5 +179,7 @@ export interface LogLine {
 export interface Me {
   uid: string;
   email: string;
+  /** Release steps. */
   steps: string[];
+  ci: CiInfo;
 }

@@ -8,7 +8,10 @@
 #   PUBLISHER_SECRETS     KEY=value file with CARGO_REGISTRY_TOKEN
 #   PUBLISHER_WEB_ROOT    built UI                         (default web/dist)
 #   PUBLISHER_BIND        listen address, applied by the binary (default 127.0.0.1:8080)
-#   PUBLISHER_RUN_AS      build user for untrusted commands (empty: the service user)
+#   PUBLISHER_RUN_AS      build user for the release's commands (empty: the service user)
+#   PUBLISHER_CI_RUN_AS   build user for PR CI, a PR's code (required when RUN_AS is set)
+#   PUBLISHER_CI_WORK_DIR PR CI clone and target           (default <work>/pr-ci)
+#   PUBLISHER_CI_MIRROR   the service's bare mirror of PRs (default <work>/pr-mirror.git)
 
 server:
   home_dir: "~/.gears-publisher"   # ${VAR} is not expanded here
@@ -78,6 +81,18 @@ gears:
       users: *identities
       # Build user for everything that runs gears-rust's code (sudo -u); empty locally.
       run_as: "${PUBLISHER_RUN_AS:-}"
+      # PR CI runs a pull request's code: as its own user, in its own clone and target,
+      # so that it cannot reach the release's. Checks get only GITHUB_CI_TOKEN (a
+      # read-only token, optional) from secrets_file, never the gh login.
+      ci_run_as: "${PUBLISHER_CI_RUN_AS:-}"
+      ci_work_dir: "${PUBLISHER_CI_WORK_DIR:-}"
+      ci_mirror_dir: "${PUBLISHER_CI_MIRROR:-}"
+      # Git dependencies PR checks fetch from elsewhere (git `insteadOf`). GitHub has
+      # flagged constructorfabric: its public cargo-gears (make dylint) answers 404 to
+      # anonymous git, so a public fork stands in. The fork must carry the tag
+      # gears-rust pins.
+      ci_git_rewrites:
+        "https://github.com/constructorfabric/cargo-gears": "https://github.com/MikeFalcon77/cargo-gears"
       # `checks` defaults to gears-rust's ci.yml jobs without Docker (see config.rs).
       env:
         CARGO_BUILD_JOBS: "${PUBLISHER_CARGO_JOBS:-12}"

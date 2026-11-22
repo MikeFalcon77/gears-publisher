@@ -1,5 +1,4 @@
-//! crates.io: rate-limit answers and the sparse index.
-use async_trait::async_trait;
+//! crates.io: rate-limit answers and the sparse index format.
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
@@ -54,48 +53,6 @@ pub fn versions(index_file: &str) -> Vec<String> {
         .filter(|v| !v["yanked"].as_bool().unwrap_or(false))
         .filter_map(|v| v["vers"].as_str().map(str::to_owned))
         .collect()
-}
-
-/// Looks up published versions. Faked in tests.
-#[async_trait]
-pub trait Registry: Send + Sync + 'static {
-    /// Non-yanked versions of `name`; empty when the crate does not exist.
-    async fn versions(&self, name: &str) -> anyhow::Result<Vec<String>>;
-}
-
-/// The crates.io sparse index over HTTPS.
-pub struct SparseIndex {
-    pub base: String,
-    pub http: reqwest::Client,
-}
-
-impl SparseIndex {
-    pub fn new(base: String) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent("gears-publisher (release verification)")
-            .timeout(Duration::from_secs(30))
-            .build()?;
-        Ok(Self { base, http })
-    }
-}
-
-#[async_trait]
-impl Registry for SparseIndex {
-    async fn versions(&self, name: &str) -> anyhow::Result<Vec<String>> {
-        let url = format!("{}/{}", self.base.trim_end_matches('/'), index_path(name));
-        // The CDN may serve a stale file right after a publish; ask for a fresh one.
-        let response = self
-            .http
-            .get(&url)
-            .header("Cache-Control", "no-cache")
-            .send()
-            .await?;
-        match response.status() {
-            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::FORBIDDEN => Ok(Vec::new()),
-            status if status.is_success() => Ok(versions(&response.text().await?)),
-            status => anyhow::bail!("{url}: HTTP {status}"),
-        }
-    }
 }
 
 #[cfg(test)]

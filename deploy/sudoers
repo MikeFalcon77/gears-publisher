@@ -1,6 +1,6 @@
 # /etc/sudoers.d/gears-publisher (installed by provision.sh)
 #
-# The service (publisher) runs every command that executes gears-rust's code as
+# The service (publisher) runs every command that executes gears-rust's main as
 # publisher-build, which cannot read the service's secrets, home or binaries.
 # !use_pty keeps the command in sudo's process group, so cancelling a step can signal
 # the whole group. SETENV allows --preserve-env=<names>: the service passes exactly
@@ -8,3 +8,9 @@
 Defaults>publisher-build !use_pty, !requiretty, !lecture, env_reset
 Defaults>publisher-build secure_path="/opt/gears-publisher/venv/bin:/opt/gears-publisher/tools/bin:/var/lib/gears-publisher-build/.cargo/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin"
 publisher ALL=(publisher-build) NOPASSWD:SETENV: ALL
+
+# PR CI runs a pull request's code as publisher-ci: not in publisher-build's group,
+# so it cannot write the release's clone, target directory or per-run files.
+Defaults>publisher-ci !use_pty, !requiretty, !lecture, env_reset
+Defaults>publisher-ci secure_path="/opt/gears-publisher/venv/bin:/opt/gears-publisher/tools/bin:/var/lib/gears-publisher-ci/.cargo/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin"
+publisher ALL=(publisher-ci) NOPASSWD:SETENV: ALL

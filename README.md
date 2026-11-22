@@ -83,11 +83,46 @@ gear starts and controls every run as a single service identity. The allowlist i
 `firebase-authn-plugin`, before a request reaches the gear. `publisher_runs.started_by` and the
 `control` lines in the log record who started a run or pressed Cancel, Resume or Retry.
 
+## PR CI
+
+The *PR CI* tab runs a pull request's CI the way gears-rust's GitHub workflows run it on a
+`pull_request` event, for a PR number (or URL). Workflow `gears-pr-ci.v1`:
+
+| Step | GitHub | Does |
+|---|---|---|
+| `changes` | ci.yml `changes` + checkout | `gh pr view`; fetches `refs/pull/N/{head,merge}` (refuses closed or conflicting PRs, waits while GitHub's merge commit lags the head); diffs the merge commit against its base; evaluates the path filters read from the PR's own `ci.yml` (`changes` job, `paths-ignore`) and `fmt.yml` (`paths`), or a built-in copy |
+| `fmt` | fmt.yml `cargo fmt (check)` | `make fmt` |
+| `repo_checks` | ci.yml `Repo checks` | gear names, PR-review rules and tests, packaging metadata, release config, release resolver |
+| `security` | ci.yml `Security (cargo-deny on Ubuntu)` | `make deny` (condensed) |
+| `clippy` | ci.yml `Clippy` | container pins, crypto facade, `make clippy` |
+| `lint` | ci.yml `Architecture Lints` | `make dylint` |
+| `test` | test-suite.yml `nextest` | `make test-no-macros` |
+| `integration` | ci.yml `Integration tests` | `make test-macros`; the database lanes need Docker and are not run |
+| `conclusion` | the PR's checks list | ✓/✗/– per job; fails the run if a job failed |
+
+Each job starts from a fresh checkout of the merge commit, runs its steps until one fails and is
+skipped when its `if:` filters (`rust`, `deps`, `ci`) say so. A failed job does not stop the
+others. **Re-run failed jobs** and **Re-run all jobs** start a new run on the PR's current head
+(re-run jobs ignore the filters); **Retry** continues a run that stopped before the jobs (e.g.
+after resolving a merge conflict). As with GitHub's `concurrency` group, a new run of the same
+PR cancels the one in progress; another PR's run has to finish first.
+
+PR CI and the release share the host: one heavy build runs at a time (release `checks`,
+`release-pr`, `release-plz release`, each CI job); the others wait and say so in their log.
+
+Not run: Docker lanes (database integration, e2e), macOS/Windows, FIPS, coverage, CodeQL, CFS.
+Results are not posted to GitHub.
+
 ## Layout
 
 ```
 crates/publisher-server   binary: gears bootstrap + api-gateway, authn, firebase plugin, types-registry
-crates/publisher          the gear: config, auth, workflow, runner, store, REST/SSE, static UI
+crates/publisher          the gear, layered like gears-rust's gears:
+  src/api/rest              routes, handlers, DTOs, problem errors, SSE, static UI
+  src/domain                models, errors, ports, repository trait, run service,
+                            release/ (gears-release.v1), ci/ (gears-pr-ci.v1), shared steps
+  src/infra                 PostgreSQL (entities, migrations, repository), subprocesses, crates.io
+  src/gear.rs, config.rs    wiring and configuration
 web/                      React 19 + Vite + Tailwind UI
 config/publisher.yaml     application config (allowlist, paths)
 deploy/                   provisioning, systemd, Caddy, deploy script, Virtuozzo spec
@@ -150,14 +185,17 @@ into the flexible part; the rest of the time the host is idle and waits for merg
    node deploy/firebase-domain.mjs <id> <ip-with-dashes>.sslip.io
    ```
 3. **Provision:** `FIREBASE_PROJECT_ID=<id> deploy/deploy.sh provision <ip>`. This installs the
-   packages, Go, protoc, gh, Node 24, PostgreSQL 16, Caddy, the `publisher` and `publisher-build`
-   users with their own rustup, the cargo tools (release-plz, cargo-gears, nextest,
+   packages, Go, protoc, gh, Node 24, PostgreSQL 16, Caddy, the `publisher`, `publisher-build` and
+   `publisher-ci` users with their own rustup, the cargo tools (release-plz, cargo-gears, nextest,
    semver-checks, cargo-deny, cargo-hack) and the Python venv. Every download and tool version
    is pinned; tarballs and `rustup-init` are checked against sha256 sums, pyyaml with
    `--require-hashes`. It also creates the database, the sudo rule, the Caddyfile and the
    systemd unit.
 4. **Secrets:** `deploy/deploy.sh secrets <ip> ~/projects/gears-rust/.env` copies only
-   `CARGO_REGISTRY_TOKEN`, over stdin, into `/etc/gears-publisher/secrets.env` (0600).
+   `CARGO_REGISTRY_TOKEN` and, if present, `GITHUB_CI_TOKEN`, over stdin, into
+   `/etc/gears-publisher/secrets.env` (0600). `GITHUB_CI_TOKEN` is for PR CI: a fine-grained
+   token with read-only access to contents, for the git dependencies on GitHub (`make dylint`
+   builds its lints from cargo-gears). Without it, those checks cannot fetch them.
 5. **GitHub** (manual, on the host): `sudo -iu publisher gh auth login` and
    `git config --global user.email` for that account (provision copies the email to the build
    user, whose commits release-plz pushes with `GIT_TOKEN`). Better than a personal login: a
@@ -181,7 +219,7 @@ limits leave room for that (failed checks and repeated publish errors stop the r
   the API answers 401. A subject the gear itself does not know gets 403.
   Checked on the live host: no token, a garbage token, `alg: none`, RS256 signed with a foreign key
   under Google's real `kid`, and HS256 are all refused. So are `//`, `..`, `%2F` and other path variants.
-- Caddy proxies only `/`, `/index.html`, `/favicon.svg`, `/runs/*`, `/assets/*` and `/publisher/v1/*`.
+- Caddy proxies only `/`, `/index.html`, `/favicon.svg`, `/ci`, `/runs/*`, `/assets/*` and `/publisher/v1/*`.
   types-registry REST, `/health`, `/readyz` and OpenAPI stay on 127.0.0.1. HSTS is on.
 - Listening on the public IP: 22 (SSH), 80 and 443 (Caddy). The service (8080), PostgreSQL
   (5432) and Caddy's admin API (2019) listen on loopback only; rpcbind is disabled.
@@ -195,6 +233,12 @@ limits leave room for that (failed checks and repeated publish errors stop the r
   configured `env` and the command's own variables. `CARGO_REGISTRY_TOKEN` and the gh token
   are passed only to the commands that need them (`release-plz release`, `release-pr`,
   `release_retry.py wait/collect`), never as arguments, and are masked in the log.
+- PR CI runs a pull request's code as `publisher-ci`, which is not in `publisher-build`'s
+  group: it cannot write the release's clone, target directory or run files (a planted
+  `.git/config` there would run with the gh token at the next release). The PR is fetched into
+  the service's bare mirror (`/var/lib/gears-publisher-mirror`) with the gh token, by git
+  running as the service; the CI clone fetches from that mirror without credentials. Checks get
+  only `GITHUB_CI_TOKEN`. With `run_as` set and no `ci_run_as`, PR CI is refused.
 - What remains: those commands build crates (`cargo publish` verifies), so a malicious
   dependency could read the two tokens from its environment during a release, as in GitHub
   Actions. With a personal `gh` login that token reaches all of its owner's repositories; a

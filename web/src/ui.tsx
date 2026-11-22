@@ -67,3 +67,13 @@ export function ErrorNote({ error }: { error: unknown }) {
     </p>
   );
 }
+
+export function Details({ title, children }: { title: string; children: string }) {
+  return (
+    <details>
+      <summary className="cursor-pointer text-slate-700">{title}</summary>
+      <pre className="mt-1 max-h-64 overflow-auto rounded bg-slate-50 p-2 font-mono text-xs">{children}</pre>
+    </details>
+  );
+}
+

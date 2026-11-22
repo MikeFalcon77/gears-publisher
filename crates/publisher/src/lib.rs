@@ -1,12 +1,8 @@
-//! The publisher gear: releases gears-rust from a button in the web UI.
+//! The publisher gear: releases gears-rust and runs its PR CI from a web UI.
 mod api;
-pub mod auth;
 pub mod config;
-pub mod crates_io;
+pub mod domain;
 mod gear;
-pub mod runner;
-pub mod service;
-pub mod store;
-pub mod workflow;
+pub mod infra;
 
 pub use gear::PublisherGear;

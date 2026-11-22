@@ -1,7 +1,7 @@
 //! Gear configuration: repository, paths, tools and the user directory.
 use secrecy::SecretString;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -46,6 +46,28 @@ pub struct PublisherConfig {
     pub run_as: Option<String>,
     #[serde(default = "defaults::sudo")]
     pub sudo_bin: String,
+    /// Build user for PR CI: a pull request's code. Must differ from `run_as`, so
+    /// that it cannot reach the release's clone and target directory. Empty: PR CI
+    /// runs as the service when `run_as` is empty too (local development) and is
+    /// refused otherwise.
+    #[serde(default)]
+    #[expand_vars]
+    pub ci_run_as: Option<String>,
+    /// The CI clone (`<ci_work_dir>/gears-rust`) and its target directory
+    /// (`<ci_work_dir>/target`); writable by `ci_run_as` only. Default `<work_dir>/pr-ci`.
+    #[serde(default)]
+    #[expand_vars]
+    pub ci_work_dir: Option<String>,
+    /// The service's bare mirror the CI clone fetches PRs from: written by the service
+    /// only, readable by `ci_run_as`. Default `<work_dir>/pr-mirror.git`.
+    #[serde(default)]
+    #[expand_vars]
+    pub ci_mirror_dir: Option<String>,
+    /// Git URL rewrites for PR checks, original prefix to replacement (git's
+    /// `url.<replacement>.insteadOf <original>`): a git dependency is fetched from a
+    /// copy, e.g. a public fork, when no CI token can read the original.
+    #[serde(default)]
+    pub ci_git_rewrites: BTreeMap<String, String>,
     /// Commands of the `checks` step, run in order in the clone (split on whitespace;
     /// `make` resolves to `make_bin`). The default follows the jobs of gears-rust's
     /// `ci.yml` that need no Docker.
@@ -137,10 +159,85 @@ impl PublisherConfig {
     /// The configured build user, if any.
     #[must_use]
     pub fn build_user(&self) -> Option<&str> {
-        self.run_as
-            .as_deref()
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
+        non_empty(self.run_as.as_deref())
+    }
+    /// The configured PR CI build user, if any.
+    #[must_use]
+    pub fn ci_user(&self) -> Option<&str> {
+        non_empty(self.ci_run_as.as_deref())
+    }
+    /// Why PR CI cannot run with this configuration, if it cannot.
+    #[must_use]
+    pub fn ci_refusal(&self) -> Option<&'static str> {
+        match (self.build_user(), self.ci_user()) {
+            (Some(_), None) => Some(
+                "PR CI needs its own build user: set publisher.ci_run_as (PUBLISHER_CI_RUN_AS)",
+            ),
+            (Some(release), Some(ci)) if release == ci => {
+                Some("publisher.ci_run_as must differ from run_as: PR code would reach the release")
+            }
+            _ => None,
+        }
+    }
+    #[must_use]
+    pub fn ci_work_dir(&self) -> PathBuf {
+        non_empty(self.ci_work_dir.as_deref()).map_or_else(
+            || PathBuf::from(&self.work_dir).join("pr-ci"),
+            PathBuf::from,
+        )
+    }
+    #[must_use]
+    pub fn ci_clone_dir(&self) -> PathBuf {
+        self.ci_work_dir().join("gears-rust")
+    }
+    #[must_use]
+    pub fn ci_target_dir(&self) -> PathBuf {
+        self.ci_work_dir().join("target")
+    }
+    /// The service's bare mirror the CI clone fetches PRs from.
+    #[must_use]
+    pub fn ci_mirror_dir(&self) -> PathBuf {
+        non_empty(self.ci_mirror_dir.as_deref()).map_or_else(
+            || PathBuf::from(&self.work_dir).join("pr-mirror.git"),
+            PathBuf::from,
+        )
+    }
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(run_as: &str, ci_run_as: &str) -> PublisherConfig {
+        serde_json::from_value(serde_json::json!({
+            "work_dir": "/w", "target_dir": "/t", "queue_dsn": "postgres://x",
+            "firebase_project_id": "p", "run_as": run_as, "ci_run_as": ci_run_as,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn pr_ci_needs_its_own_build_user_when_the_release_has_one() {
+        assert!(config("", "").ci_refusal().is_none());
+        assert!(config("publisher-build", "").ci_refusal().is_some());
+        assert!(
+            config("publisher-build", "publisher-build")
+                .ci_refusal()
+                .is_some()
+        );
+        assert!(
+            config("publisher-build", "publisher-ci")
+                .ci_refusal()
+                .is_none()
+        );
+        assert_eq!(
+            config("", "").ci_clone_dir(),
+            PathBuf::from("/w/pr-ci/gears-rust")
+        );
     }
 }
 

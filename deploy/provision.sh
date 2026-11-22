@@ -10,6 +10,9 @@
 #                    release-plz, release_retry.py) through sudo. It cannot read the
 #                    secrets, the service's home or its binaries; it gets the tokens
 #                    only as environment of the commands that need them.
+#   publisher-ci     runs PR CI: a pull request's code. It cannot write anything of
+#                    the release (not in publisher-build's group) and gets no token
+#                    but the optional read-only GITHUB_CI_TOKEN.
 # Binaries, the UI, tools and the Python venv are root-owned.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -17,6 +20,9 @@ export DEBIAN_FRONTEND=noninteractive
 APP=/opt/gears-publisher
 WORK=/var/lib/gears-publisher
 BUILD_HOME=/var/lib/gears-publisher-build
+CI_HOME=/var/lib/gears-publisher-ci
+# The service's bare mirror PR CI fetches from; outside $WORK, which is chowned below.
+MIRROR=/var/lib/gears-publisher-mirror
 ETC=/etc/gears-publisher
 RUST_TOOLCHAIN=1.98.1
 
@@ -119,6 +125,11 @@ install -d -o publisher -g publisher -m 0755 "$APP/src"
 install -d -o publisher-build -g publisher-build -m 2775 "$WORK"
 chown -R publisher-build:publisher-build "$WORK"
 install -d -o publisher -g publisher-build -m 2775 "$WORK/runs"
+id publisher-ci >/dev/null 2>&1 \
+  || useradd --system --create-home --home-dir "$CI_HOME" --shell /usr/sbin/nologin publisher-ci
+chmod 0750 "$CI_HOME"
+install -d -o publisher-ci -g publisher-ci -m 0755 "$CI_HOME/work"
+install -d -o publisher -g publisher -m 0755 "$MIRROR"
 install -d -o root -g publisher -m 0750 "$ETC"
 if [[ -f "$ETC/secrets.env" ]]; then
   chown root:publisher "$ETC/secrets.env" && chmod 0640 "$ETC/secrets.env"
@@ -126,7 +137,7 @@ else
   install -o root -g publisher -m 0640 /dev/null "$ETC/secrets.env"
 fi
 
-log "sudo rule for the build user"
+log "sudo rules for the build users"
 install -o root -g root -m 0440 "$APP/src/deploy/sudoers" "$tmp/sudoers"
 visudo -cqf "$tmp/sudoers"
 install -o root -g root -m 0440 "$tmp/sudoers" /etc/sudoers.d/gears-publisher
@@ -146,10 +157,11 @@ install_rustup() {
   sudo -u "$1" HOME="$2" "$2/.cargo/bin/rustup" default "$RUST_TOOLCHAIN"
 }
 
-log "Rust for the service (publisher) and for builds (publisher-build)"
+log "Rust for the service (publisher) and for builds (publisher-build, publisher-ci)"
 chmod 755 "$tmp"
 install_rustup publisher /home/publisher
 install_rustup publisher-build "$BUILD_HOME"
+install_rustup publisher-ci "$CI_HOME"
 
 log "cargo tools (built as publisher, installed root-owned)"
 for tool in "${CARGO_TOOLS[@]}"; do
@@ -169,23 +181,29 @@ echo "$PYYAML_REQUIREMENT" > "$tmp/requirements.txt"
 "$APP/venv/bin/pip" install -q --disable-pip-version-check --only-binary :all: \
   --require-hashes -r "$tmp/requirements.txt"
 
-log "git for the build user"
-build_git() { sudo -u publisher-build HOME="$BUILD_HOME" git config --global "$@"; }
-build_git init.defaultBranch main
-build_git user.name >/dev/null || build_git user.name "gears-publisher"
+log "git for the build users"
 email=$(sudo -iu publisher git config --global --get user.email || true)
-[[ -n "$email" ]] && build_git user.email "$email"
-# ci.yml's workaround: dylint (cargo gears lint --dylint) checks out rust-clippy's
-# `master`, which is now `main`. Serve its clone from a mirror where master is main.
-mirror="$BUILD_HOME/rust-clippy.git"
-if [[ ! -d "$mirror" ]]; then
-  sudo -u publisher-build git clone --bare --quiet https://github.com/rust-lang/rust-clippy "$mirror"
-else
-  sudo -u publisher-build git -C "$mirror" fetch --quiet origin '+refs/heads/*:refs/heads/*' || true
-fi
-sudo -u publisher-build git -C "$mirror" branch -f master main
-sudo -u publisher-build git -C "$mirror" symbolic-ref HEAD refs/heads/master
-build_git "url.file://$mirror.insteadOf" https://github.com/rust-lang/rust-clippy
+# git_for_builds <user> <home>
+git_for_builds() {
+  local user=$1 home=$2
+  build_git() { sudo -u "$user" HOME="$home" git config --global "$@"; }
+  build_git init.defaultBranch main
+  build_git user.name >/dev/null || build_git user.name "gears-publisher"
+  [[ -n "$email" ]] && build_git user.email "$email"
+  # ci.yml's workaround: dylint (cargo gears lint --dylint) checks out rust-clippy's
+  # `master`, which is now `main`. Serve its clone from a mirror where master is main.
+  local mirror="$home/rust-clippy.git"
+  if [[ ! -d "$mirror" ]]; then
+    sudo -u "$user" git clone --bare --quiet https://github.com/rust-lang/rust-clippy "$mirror"
+  else
+    sudo -u "$user" git -C "$mirror" fetch --quiet origin '+refs/heads/*:refs/heads/*' || true
+  fi
+  sudo -u "$user" git -C "$mirror" branch -f master main
+  sudo -u "$user" git -C "$mirror" symbolic-ref HEAD refs/heads/master
+  build_git "url.file://$mirror.insteadOf" https://github.com/rust-lang/rust-clippy
+}
+git_for_builds publisher-build "$BUILD_HOME"
+git_for_builds publisher-ci "$CI_HOME"
 
 log "PostgreSQL"
 systemctl enable --now postgresql

@@ -5,18 +5,21 @@
 //! `DATABASE_URL` and anything else in its environment never does. Commands that run
 //! code from the released repository (everything except `gh`) can run as a separate
 //! build user through `sudo`; that user cannot read the service's secrets.
-use crate::store::{Journal, NewLine};
+mod condense;
+mod text;
+
+pub use condense::Condenser;
+pub use text::{Masker, strip_ansi};
+
+use crate::domain::models::NewLine;
+use crate::domain::ports::{Cmd, CmdOutput, Exec, ExecError, Logged, StepScope};
 use async_trait::async_trait;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 /// Lines of combined output kept for error classification.
 const TAIL_LINES: usize = 400;
@@ -30,191 +33,6 @@ const MAX_LINE_BYTES: u64 = 64 * 1024;
 const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 /// Variables of the service's own environment that commands may see.
 const INHERITED_ENV: [&str; 7] = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "TMPDIR", "TZ"];
-
-/// Where a command's output goes: the run, step and attempt it belongs to.
-#[derive(Clone)]
-pub struct StepScope {
-    pub run_id: Uuid,
-    pub step: String,
-    pub attempt: u32,
-    pub cancel: CancellationToken,
-    pub journal: Arc<dyn Journal>,
-}
-
-impl StepScope {
-    /// A note from the publisher itself.
-    pub async fn info(&self, line: impl Into<String>) {
-        self.journal
-            .log(NewLine {
-                run_id: self.run_id,
-                step: self.step.clone(),
-                attempt: self.attempt,
-                stream: "info",
-                line: line.into(),
-            })
-            .await;
-    }
-}
-
-/// A command to run.
-#[derive(Debug, Clone)]
-pub struct Cmd {
-    pub program: String,
-    pub args: Vec<String>,
-    pub cwd: PathBuf,
-    pub env: Vec<(String, String)>,
-    /// Passed as environment and masked in every logged line.
-    pub secrets: Vec<(String, SecretString)>,
-    /// Keep stdout in [`CmdOutput::stdout`].
-    pub capture: bool,
-    /// What of the output reaches the run log.
-    pub logged: Logged,
-    /// Substrings to look for in every line; found ones end up in [`CmdOutput::seen`].
-    pub watch: Vec<&'static str>,
-    /// Runs as the service user even when a build user is configured: only for tools
-    /// that execute none of the repository's code and need the service's credentials (`gh`).
-    pub trusted: bool,
-}
-
-/// What of a command's output is logged. Masking, `tail`, `watch` and `capture` see
-/// every line regardless.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Logged {
-    #[default]
-    All,
-    /// Stderr only: stdout carries a secret (`gh auth token`).
-    Stderr,
-    /// Errors and warnings with some context (see [`Condenser`]): for tools whose full
-    /// output is too large to read (`cargo deny`).
-    Condensed,
-}
-
-impl Cmd {
-    pub fn new(program: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
-        Self {
-            program: program.into(),
-            args: Vec::new(),
-            cwd: cwd.into(),
-            env: Vec::new(),
-            secrets: Vec::new(),
-            capture: false,
-            logged: Logged::All,
-            watch: Vec::new(),
-            trusted: false,
-        }
-    }
-    #[must_use]
-    pub fn arg(mut self, arg: impl Into<String>) -> Self {
-        self.args.push(arg.into());
-        self
-    }
-    #[must_use]
-    pub fn args<I, S>(mut self, args: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.args.extend(args.into_iter().map(Into::into));
-        self
-    }
-    #[must_use]
-    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.env.push((key.into(), value.into()));
-        self
-    }
-    #[must_use]
-    pub fn secret(mut self, key: impl Into<String>, value: SecretString) -> Self {
-        self.secrets.push((key.into(), value));
-        self
-    }
-    #[must_use]
-    pub fn capture(mut self) -> Self {
-        self.capture = true;
-        self
-    }
-    #[must_use]
-    pub fn quiet(mut self) -> Self {
-        self.capture = true;
-        self.logged = Logged::Stderr;
-        self
-    }
-    #[must_use]
-    pub fn trusted(mut self) -> Self {
-        self.trusted = true;
-        self
-    }
-    #[must_use]
-    /// No effect after [`Cmd::quiet`]: its stdout must not be logged at all.
-    pub fn condensed(mut self) -> Self {
-        if self.logged == Logged::All {
-            self.logged = Logged::Condensed;
-        }
-        self
-    }
-    #[must_use]
-    pub fn watch(mut self, patterns: &[&'static str]) -> Self {
-        self.watch.extend_from_slice(patterns);
-        self
-    }
-    /// `program arg…` as logged.
-    #[must_use]
-    pub fn display(&self) -> String {
-        std::iter::once(self.program.as_str())
-            .chain(self.args.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-}
-
-/// A finished command.
-#[derive(Debug, Clone, Default)]
-pub struct CmdOutput {
-    /// Exit code; `None` when killed by a signal.
-    pub code: Option<i32>,
-    /// Captured stdout (only with [`Cmd::capture`]).
-    pub stdout: String,
-    /// The last lines of stdout and stderr, masked.
-    pub tail: Vec<String>,
-    /// The [`Cmd::watch`] patterns that occurred.
-    pub seen: Vec<&'static str>,
-}
-
-impl CmdOutput {
-    #[must_use]
-    pub fn success(&self) -> bool {
-        self.code == Some(0)
-    }
-    #[must_use]
-    pub fn saw(&self, pattern: &str) -> bool {
-        self.seen.contains(&pattern)
-    }
-    #[must_use]
-    pub fn tail_text(&self) -> String {
-        self.tail.join("\n")
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ExecError {
-    #[error("failed to start {program}: {source}")]
-    Spawn {
-        program: String,
-        source: std::io::Error,
-    },
-    #[error("failed while running {program}: {source}")]
-    Io {
-        program: String,
-        source: std::io::Error,
-    },
-    #[error("cancelled")]
-    Cancelled,
-}
-
-/// Runs commands. Faked in workflow tests.
-#[async_trait]
-pub trait Exec: Send + Sync + 'static {
-    async fn run(&self, scope: &StepScope, cmd: Cmd) -> Result<CmdOutput, ExecError>;
-}
 
 /// Real subprocesses.
 pub struct ProcessExec {
@@ -440,6 +258,32 @@ impl Exec for ProcessExec {
     }
 }
 
+/// Runs only `trusted` commands; the rest fail to start. For PR CI when it has no
+/// build user of its own: a recovered run must not run a PR's code as the service.
+pub struct RefuseUntrusted(pub ProcessExec);
+
+#[async_trait]
+impl Exec for RefuseUntrusted {
+    async fn run(&self, scope: &StepScope, cmd: Cmd) -> Result<CmdOutput, ExecError> {
+        if cmd.trusted {
+            return self.0.run(scope, cmd).await;
+        }
+        log(
+            scope,
+            "info",
+            format!(
+                "refused `{}`: PR CI has no build user of its own",
+                cmd.program
+            ),
+        )
+        .await;
+        Err(ExecError::Spawn {
+            program: cmd.program,
+            source: std::io::Error::other("PR CI is disabled"),
+        })
+    }
+}
+
 const STUCK: &str = "output still open after exit; stopped reading";
 
 /// Stops reading the pipes.
@@ -536,186 +380,15 @@ async fn terminate(pid: Option<u32>, run_as: Option<&RunAs>, child: &mut tokio::
     let _ = child.kill().await;
 }
 
-/// Lines of context kept before a problem.
-const CONDENSE_BEFORE: usize = 2;
-/// Lines of one diagnostic kept (cargo-deny's inclusion trees run to hundreds).
-const CONDENSE_BLOCK: usize = 40;
-/// Lines kept from the end of the output after the last diagnostic (the summary,
-/// `make: ***`).
-const CONDENSE_TAIL: usize = 15;
-
-/// Reduces output to its errors and warnings: each diagnostic (up to a blank line or
-/// [`CONDENSE_BLOCK`] lines) with [`CONDENSE_BEFORE`] lines before it, plus up to
-/// [`CONDENSE_TAIL`] lines of the end that follow the last one; gaps become one
-/// `… N lines skipped` note.
-#[derive(Default)]
-pub struct Condenser {
-    /// Recent lines not logged, oldest first.
-    held: VecDeque<(&'static str, String)>,
-    /// Lines not logged since the last logged one (including `held`).
-    skipped: usize,
-    block: Block,
-}
-
-#[derive(Default, Clone, Copy)]
-enum Block {
-    /// Outside a diagnostic, or past [`CONDENSE_BLOCK`] lines of one: lines are held.
-    #[default]
-    None,
-    /// Inside a diagnostic, this many lines logged.
-    Open(usize),
-}
-
-impl Condenser {
-    /// Lines to log for one line of output.
-    pub fn push(&mut self, stream: &'static str, line: String) -> Vec<(&'static str, String)> {
-        let mut out = Vec::new();
-        if is_problem(&line) {
-            let mut before = self.held.len().min(CONDENSE_BEFORE);
-            // One more line costs no more than a note saying it was skipped.
-            if self.skipped == before + 1 && self.held.len() > before {
-                before += 1;
-            }
-            self.flush_skipped(before, &mut out);
-            let keep = self.held.len() - before;
-            out.extend(self.held.drain(..).skip(keep));
-            out.push((stream, line));
-            self.block = Block::Open(1);
-            return out;
-        }
-        let blank = line.trim().is_empty();
-        match self.block {
-            Block::Open(n) if blank || n < CONDENSE_BLOCK => {
-                self.block = if blank {
-                    Block::None
-                } else {
-                    Block::Open(n + 1)
-                };
-                out.push((stream, line));
-                return out;
-            }
-            Block::Open(_) => self.block = Block::None,
-            Block::None => {}
-        }
-        self.hold(stream, line);
-        out
-    }
-
-    /// Lines to log at the end of the output.
-    #[must_use]
-    pub fn finish(mut self) -> Vec<(&'static str, String)> {
-        let mut out = Vec::new();
-        let tail = self.held.len();
-        self.flush_skipped(tail, &mut out);
-        out.extend(self.held.drain(..));
-        out
-    }
-
-    fn hold(&mut self, stream: &'static str, line: String) {
-        if self.held.len() == CONDENSE_TAIL {
-            self.held.pop_front();
-        }
-        self.held.push_back((stream, line));
-        self.skipped += 1;
-    }
-
-    /// Notes the lines skipped, except the `shown` ones about to be logged.
-    fn flush_skipped(&mut self, shown: usize, out: &mut Vec<(&'static str, String)>) {
-        let n = self.skipped - shown;
-        if n > 0 {
-            let s = if n == 1 { "" } else { "s" };
-            out.push(("info", format!("… {n} line{s} skipped")));
-        }
-        self.skipped = 0;
-    }
-}
-
-/// `error: …`, `warning[duplicate]: …`, a logged `ERROR`/`WARN`, `make: *** …`.
-fn is_problem(line: &str) -> bool {
-    let diagnostic = ["error", "warning"].iter().any(|level| {
-        line.strip_prefix(level).is_some_and(|rest| {
-            let rest = match rest.strip_prefix('[') {
-                Some(code) => code.split_once(']').map_or("", |(_, rest)| rest),
-                None => rest,
-            };
-            rest.starts_with(": ")
-        })
-    });
-    diagnostic
-        || ["[ERROR]", "[WARN]", " ERROR ", " WARN "]
-            .iter()
-            .any(|m| line.contains(m))
-        || (line.starts_with("make") && line.contains(": ***"))
-}
-
-/// Replaces secret values with `***`.
-pub struct Masker {
-    secrets: Vec<String>,
-}
-
-impl Masker {
-    pub fn new<'a>(secrets: impl IntoIterator<Item = &'a str>) -> Self {
-        let mut secrets: Vec<String> = secrets
-            .into_iter()
-            .filter(|s| s.len() >= 6)
-            .map(str::to_owned)
-            .collect();
-        // Longest first, so a secret containing another is masked whole.
-        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
-        Self { secrets }
-    }
-
-    #[must_use]
-    pub fn mask(&self, text: &str) -> String {
-        let mut text = text.to_owned();
-        for secret in &self.secrets {
-            if text.contains(secret.as_str()) {
-                text = text.replace(secret.as_str(), "***");
-            }
-        }
-        text
-    }
-}
-
-/// Removes ANSI escape sequences (CSI and OSC).
-#[must_use]
-pub fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('[') => {
-                for c in chars.by_ref() {
-                    if ('@'..='~').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                while let Some(c) = chars.next() {
-                    if c == '\u{7}' {
-                        break;
-                    }
-                    if c == '\u{1b}' && chars.peek() == Some(&'\\') {
-                        chars.next();
-                        break;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
+    use super::condense::{CONDENSE_BLOCK, CONDENSE_TAIL, is_problem};
     use super::*;
-    use crate::store::MemoryJournal;
+    use crate::domain::ports::journal::MemoryJournal;
+    use secrecy::SecretString;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
 
     fn scope(journal: Arc<MemoryJournal>) -> StepScope {
         StepScope {

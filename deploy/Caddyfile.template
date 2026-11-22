@@ -15,7 +15,7 @@ __DOMAIN__ {
 		}
 	}
 
-	@app path / /index.html /favicon.svg /runs/* /assets/* /publisher/v1/*
+	@app path / /index.html /favicon.svg /ci /runs/* /assets/* /publisher/v1/*
 	handle @app {
 		encode gzip
 		reverse_proxy 127.0.0.1:8080

@@ -6,6 +6,7 @@ import { configured, login, logout, watchUser, type Identity } from './firebase'
 import { navigate, useRoute } from './router';
 import { RunPage } from './RunPage';
 import { RunsPage } from './RunsPage';
+import { CiPage } from './CiPage';
 import type { Me } from './types';
 import { Button, ErrorNote } from './ui';
 import { FlaggedFooter, Quip, UnflaggedBadge } from './irony';
@@ -53,7 +54,15 @@ function Shell({ me }: { me: Me }) {
           >
             <Rocket className="h-5 w-5 text-sky-600" /> gears-publisher
           </a>
-          <span className="text-sm text-slate-500">constructorfabric/gears-rust</span>
+          <nav className="flex items-center gap-1 text-sm">
+            <NavLink to="/" active={route.page === 'runs'}>
+              Releases
+            </NavLink>
+            <NavLink to="/ci" active={route.page === 'ci'}>
+              PR CI
+            </NavLink>
+          </nav>
+          <span className="hidden text-sm text-slate-500 md:inline">constructorfabric/gears-rust</span>
           <UnflaggedBadge />
           <div className="ml-auto flex items-center gap-3 text-sm text-slate-600">
             <span>{me.email}</span>
@@ -64,10 +73,32 @@ function Shell({ me }: { me: Me }) {
         </div>
       </header>
       <main className="mx-auto flex w-full max-w-[1600px] flex-1 flex-col px-4 py-4">
-        {route.page === 'run' ? <RunPage id={route.id} steps={me.steps} /> : <RunsPage steps={me.steps} />}
+        {route.page === 'run' ? (
+          <RunPage id={route.id} me={me} />
+        ) : route.page === 'ci' ? (
+          <CiPage ci={me.ci} />
+        ) : (
+          <RunsPage steps={me.steps} />
+        )}
       </main>
       <FlaggedFooter />
     </div>
+  );
+}
+
+function NavLink({ to, active, children }: { to: string; active: boolean; children: React.ReactNode }) {
+  return (
+    <a
+      href={to}
+      aria-current={active ? 'page' : undefined}
+      onClick={(e) => {
+        e.preventDefault();
+        navigate(to);
+      }}
+      className={`rounded-md px-2.5 py-1 font-medium ${active ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'}`}
+    >
+      {children}
+    </a>
   );
 }
 

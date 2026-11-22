@@ -1,84 +1,9 @@
 use super::*;
-use crate::runner::{Cmd, CmdOutput, Exec, ExecError, StepScope};
-use crate::store::MemoryJournal;
+use crate::domain::ports::journal::MemoryJournal;
+use crate::domain::testing::{FakeExec, fail, ok};
 use async_trait::async_trait;
-use parking_lot::Mutex;
 use std::collections::HashMap;
 use toolkit_durable_execution::testing::{TestOutcome, TestRuntime};
-
-type Handler = Box<dyn Fn(&Cmd, usize) -> CmdOutput + Send + Sync>;
-
-/// Answers commands by the first rule whose pattern occurs in `program args…`.
-/// Unmatched commands succeed with no output.
-#[derive(Default)]
-struct FakeExec {
-    rules: Vec<(&'static str, Handler)>,
-    calls: Mutex<Vec<String>>,
-    counts: Mutex<HashMap<&'static str, usize>>,
-}
-
-impl FakeExec {
-    fn on(
-        mut self,
-        pattern: &'static str,
-        handler: impl Fn(&Cmd, usize) -> CmdOutput + Send + Sync + 'static,
-    ) -> Self {
-        self.rules.push((pattern, Box::new(handler)));
-        self
-    }
-    fn calls_matching(&self, pattern: &str) -> usize {
-        self.calls
-            .lock()
-            .iter()
-            .filter(|c| c.contains(pattern))
-            .count()
-    }
-}
-
-#[async_trait]
-impl Exec for FakeExec {
-    async fn run(&self, _: &StepScope, cmd: Cmd) -> Result<CmdOutput, ExecError> {
-        let line = cmd.display();
-        self.calls.lock().push(line.clone());
-        for (pattern, handler) in &self.rules {
-            if line.contains(pattern) {
-                let n = {
-                    let mut counts = self.counts.lock();
-                    let n = counts.entry(pattern).or_default();
-                    *n += 1;
-                    *n
-                };
-                let mut out = handler(&cmd, n);
-                out.seen = cmd
-                    .watch
-                    .iter()
-                    .copied()
-                    .filter(|p| out.tail.iter().any(|l| l.contains(p)))
-                    .collect();
-                return Ok(out);
-            }
-        }
-        Ok(ok(""))
-    }
-}
-
-fn ok(stdout: &str) -> CmdOutput {
-    CmdOutput {
-        code: Some(0),
-        stdout: stdout.to_owned(),
-        tail: Vec::new(),
-        seen: Vec::new(),
-    }
-}
-
-fn fail(lines: &[&str]) -> CmdOutput {
-    CmdOutput {
-        code: Some(1),
-        stdout: String::new(),
-        tail: lines.iter().map(|l| (*l).to_owned()).collect(),
-        seen: Vec::new(),
-    }
-}
 
 struct FakeRegistry(HashMap<String, Vec<String>>);
 
@@ -150,6 +75,7 @@ fn harness(exec: FakeExec, registry: FakeRegistry, timings: &serde_json::Value) 
         exec: Arc::clone(&exec) as Arc<dyn Exec>,
         journal: Arc::clone(&journal) as Arc<dyn Journal>,
         registry: Arc::new(registry),
+        slot: Arc::new(BuildSlot::default()),
     });
     Harness {
         workflow: definition(&deps).unwrap(),
@@ -317,10 +243,7 @@ async fn collect_recovers_earlier_attempts_when_a_retry_succeeded() {
         collect_writes(cmd, "[]")
     });
     // Rules match in order: put the asserting rule first.
-    let exec = FakeExec {
-        rules: exec.rules.into_iter().rev().collect(),
-        ..FakeExec::default()
-    };
+    let exec = exec.reversed();
     let h = harness(exec, published(), &fast());
     let run = TestRuntime::new()
         .run(&h.workflow, ReleaseInput::default())
@@ -361,10 +284,7 @@ async fn nothing_to_release_skips_the_rest() {
 #[tokio::test]
 async fn a_closed_pr_fails_the_run() {
     let exec = release_exec().on("gh pr view", |_, _| ok(r#"{"state":"CLOSED"}"#));
-    let exec = FakeExec {
-        rules: exec.rules.into_iter().rev().collect(),
-        ..FakeExec::default()
-    };
+    let exec = exec.reversed();
     let h = harness(exec, published(), &fast());
     let run = TestRuntime::new()
         .run(&h.workflow, ReleaseInput::default())
@@ -382,10 +302,7 @@ async fn a_closed_pr_fails_the_run() {
 #[tokio::test]
 async fn failed_checks_stop_without_retrying() {
     let exec = release_exec().on("make test-no-macros", |_, _| fail(&["test failed"]));
-    let exec = FakeExec {
-        rules: exec.rules.into_iter().rev().collect(),
-        ..FakeExec::default()
-    };
+    let exec = exec.reversed();
     let h = harness(exec, published(), &fast());
     let run = TestRuntime::new()
         .run(&h.workflow, ReleaseInput::default())
@@ -407,10 +324,7 @@ async fn publish_gives_up_after_the_configured_failures() {
     let exec = release_exec().on("release-plz release -o json", |_, _| {
         fail(&["error: failed to verify package"])
     });
-    let exec = FakeExec {
-        rules: exec.rules.into_iter().rev().collect(),
-        ..FakeExec::default()
-    };
+    let exec = exec.reversed();
     let h = harness(
         exec,
         published(),
@@ -520,16 +434,6 @@ fn releasable_packages_follow_release_retry() {
 }
 
 #[test]
-fn env_files_are_parsed() {
-    let text = "# comment\nexport CARGO_REGISTRY_TOKEN=\"abc\"\nOTHER=1\n";
-    assert_eq!(
-        env_file_value(text, "CARGO_REGISTRY_TOKEN").as_deref(),
-        Some("abc")
-    );
-    assert_eq!(env_file_value(text, "MISSING"), None);
-}
-
-#[test]
 fn previous_version_is_the_highest_below_current() {
     let versions = ["0.1.0", "0.10.0", "0.9.0", "0.11.0-rc.1", "0.11.0", "junk"].map(String::from);
     assert_eq!(
@@ -561,10 +465,7 @@ async fn checks_follow_main_when_it_moves_before_the_release_pr() {
         .on("rev-parse origin/main", |_, n| {
             ok(if n == 1 { "abc123\n" } else { "fix789\n" })
         });
-    let exec = FakeExec {
-        rules: exec.rules.into_iter().rev().collect(),
-        ..FakeExec::default()
-    };
+    let exec = exec.reversed();
     let h = harness(exec, published(), &fast());
     let run = TestRuntime::new()
         .run(&h.workflow, ReleaseInput { dry_run: true })
@@ -588,10 +489,7 @@ async fn checks_fetch_git_dependencies_with_the_token() {
         );
         ok("")
     });
-    let exec = FakeExec {
-        rules: exec.rules.into_iter().rev().collect(),
-        ..FakeExec::default()
-    };
+    let exec = exec.reversed();
     let h = harness(exec, published(), &fast());
     let run = TestRuntime::new()
         .run(&h.workflow, ReleaseInput { dry_run: true })

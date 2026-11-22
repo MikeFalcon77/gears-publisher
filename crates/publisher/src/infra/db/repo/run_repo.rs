@@ -1,8 +1,11 @@
-//! The gear's own tables: who started a run, its facts and its log.
+//! Run metadata and the run log in PostgreSQL, with a live fan-out.
+use crate::domain::models::{LiveEvent, LogLine, NewLine, RunRecord};
+use crate::domain::ports::Journal;
+use crate::domain::repos::RunRepository;
+use crate::infra::db::entity::{log, runs};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use sea_orm::{Set, entity::prelude::*, sea_query::Expr};
-use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use toolkit_db::secure::{
@@ -18,62 +21,6 @@ const BATCH: usize = 500;
 /// Lines waiting for the writer; a full queue slows the commands' output down.
 const QUEUE: usize = 16 * 1024;
 
-pub mod runs {
-    use sea_orm::entity::prelude::*;
-    use toolkit_db_macros::Scopable;
-
-    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
-    #[sea_orm(table_name = "publisher_runs")]
-    #[secure(unrestricted)]
-    pub struct Model {
-        #[sea_orm(primary_key, auto_increment = false)]
-        pub run_id: Uuid,
-        pub started_by: String,
-        pub dry_run: bool,
-        pub created_at: DateTimeUtc,
-        pub facts: Json,
-    }
-    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
-    impl ActiveModelBehavior for ActiveModel {}
-}
-
-pub mod log {
-    use sea_orm::entity::prelude::*;
-    use toolkit_db_macros::Scopable;
-
-    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
-    #[sea_orm(table_name = "publisher_run_log")]
-    #[secure(unrestricted)]
-    pub struct Model {
-        #[sea_orm(primary_key)]
-        pub id: i64,
-        pub run_id: Uuid,
-        pub step: String,
-        pub attempt: i32,
-        pub stream: String,
-        pub line: String,
-        pub ts: DateTimeUtc,
-    }
-    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
-    impl ActiveModelBehavior for ActiveModel {}
-}
-
-/// One stored log line. `seq` increases with every line of every run.
-#[toolkit_macros::api_dto(response)]
-#[derive(Debug, Clone)]
-pub struct LogLine {
-    pub seq: i64,
-    pub run_id: Uuid,
-    pub step: String,
-    pub attempt: i32,
-    /// `stdout`, `stderr`, `cmd` (a started command) or `info` (the publisher's own notes).
-    pub stream: String,
-    pub line: String,
-    pub ts: DateTime<Utc>,
-}
-
 impl From<log::Model> for LogLine {
     fn from(m: log::Model) -> Self {
         Self {
@@ -88,26 +35,6 @@ impl From<log::Model> for LogLine {
     }
 }
 
-/// A line before it is stored.
-#[derive(Debug, Clone)]
-pub struct NewLine {
-    pub run_id: Uuid,
-    pub step: String,
-    pub attempt: u32,
-    pub stream: &'static str,
-    pub line: String,
-}
-
-/// A run's metadata row.
-#[derive(Debug, Clone, Serialize)]
-pub struct RunRecord {
-    pub run_id: Uuid,
-    pub started_by: String,
-    pub dry_run: bool,
-    pub created_at: DateTime<Utc>,
-    pub facts: serde_json::Value,
-}
-
 impl From<runs::Model> for RunRecord {
     fn from(m: runs::Model) -> Self {
         Self {
@@ -120,27 +47,10 @@ impl From<runs::Model> for RunRecord {
     }
 }
 
-/// Pushed to live streams.
-#[derive(Debug, Clone)]
-pub enum LiveEvent {
-    Log(LogLine),
-    /// A step saved new facts, or the run's state may have changed.
-    Changed(Uuid),
-}
-
-/// What steps write while they run. A failure to record never fails a step.
-#[async_trait]
-pub trait Journal: Send + Sync + 'static {
-    async fn log(&self, line: NewLine);
-    async fn facts(&self, run_id: Uuid, facts: serde_json::Value);
-}
-
-/// PostgreSQL journal with a live fan-out.
-///
 /// Log lines go through one writer task that inserts them in batches. With a single
 /// writer, `seq` (the `BIGSERIAL` id) becomes visible in increasing order, so a reader
 /// that resumes after the last `seq` it saw never skips a line committed late.
-pub struct PgStore {
+pub struct PgRunRepository {
     db: Arc<DBProvider<DbError>>,
     live: broadcast::Sender<LiveEvent>,
     writer: mpsc::Sender<NewLine>,
@@ -150,7 +60,7 @@ fn scope() -> AccessScope {
     AccessScope::allow_all()
 }
 
-impl PgStore {
+impl PgRunRepository {
     /// Starts the log writer; call inside the runtime.
     #[must_use]
     pub fn new(db: DBProvider<DbError>) -> Self {
@@ -161,20 +71,35 @@ impl PgStore {
         Self { db, live, writer }
     }
 
-    #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<LiveEvent> {
+    async fn save_facts(&self, run_id: Uuid, facts: serde_json::Value) -> anyhow::Result<()> {
+        let conn = self.db.conn()?;
+        runs::Entity::update_many()
+            .secure()
+            .scope_with(&scope())
+            .filter(sea_orm::Condition::all().add(runs::Column::RunId.eq(run_id)))
+            .col_expr(runs::Column::Facts, Expr::value(facts))
+            .exec(&conn)
+            .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RunRepository for PgRunRepository {
+    fn subscribe(&self) -> broadcast::Receiver<LiveEvent> {
         self.live.subscribe()
     }
 
-    pub fn notify(&self, run_id: Uuid) {
+    fn notify(&self, run_id: Uuid) {
         let _ = self.live.send(LiveEvent::Changed(run_id));
     }
 
-    pub async fn create_run(
+    async fn create_run(
         &self,
         run_id: Uuid,
         started_by: &str,
         dry_run: bool,
+        facts: serde_json::Value,
     ) -> anyhow::Result<()> {
         let conn = self.db.conn()?;
         secure_insert::<runs::Entity>(
@@ -183,7 +108,7 @@ impl PgStore {
                 started_by: Set(started_by.to_owned()),
                 dry_run: Set(dry_run),
                 created_at: Set(Utc::now()),
-                facts: Set(serde_json::json!({})),
+                facts: Set(facts),
             },
             &scope(),
             &conn,
@@ -192,7 +117,7 @@ impl PgStore {
         Ok(())
     }
 
-    pub async fn run(&self, run_id: Uuid) -> anyhow::Result<Option<RunRecord>> {
+    async fn run(&self, run_id: Uuid) -> anyhow::Result<Option<RunRecord>> {
         let conn = self.db.conn()?;
         Ok(runs::Entity::find_by_id(run_id)
             .secure()
@@ -202,7 +127,7 @@ impl PgStore {
             .map(Into::into))
     }
 
-    pub async fn runs(&self, ids: Vec<Uuid>) -> anyhow::Result<Vec<RunRecord>> {
+    async fn runs(&self, ids: Vec<Uuid>) -> anyhow::Result<Vec<RunRecord>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -218,13 +143,7 @@ impl PgStore {
             .collect())
     }
 
-    /// Lines of a run after `after`, oldest first.
-    pub async fn lines(
-        &self,
-        run_id: Uuid,
-        after: i64,
-        limit: u64,
-    ) -> anyhow::Result<Vec<LogLine>> {
+    async fn lines(&self, run_id: Uuid, after: i64, limit: u64) -> anyhow::Result<Vec<LogLine>> {
         let conn = self.db.conn()?;
         Ok(log::Entity::find()
             .secure()
@@ -243,8 +162,7 @@ impl PgStore {
             .collect())
     }
 
-    /// Deletes the log of runs older than `days`; the runs themselves stay listed.
-    pub async fn prune_log(&self, days: i64) -> anyhow::Result<u64> {
+    async fn prune_log(&self, days: i64) -> anyhow::Result<u64> {
         let conn = self.db.conn()?;
         let cutoff = Utc::now() - chrono::Duration::days(days);
         let result = log::Entity::delete_many()
@@ -255,22 +173,10 @@ impl PgStore {
             .await?;
         Ok(result.rows_affected)
     }
-
-    async fn save_facts(&self, run_id: Uuid, facts: serde_json::Value) -> anyhow::Result<()> {
-        let conn = self.db.conn()?;
-        runs::Entity::update_many()
-            .secure()
-            .scope_with(&scope())
-            .filter(sea_orm::Condition::all().add(runs::Column::RunId.eq(run_id)))
-            .col_expr(runs::Column::Facts, Expr::value(facts))
-            .exec(&conn)
-            .await?;
-        Ok(())
-    }
 }
 
 #[async_trait]
-impl Journal for PgStore {
+impl Journal for PgRunRepository {
     async fn log(&self, line: NewLine) {
         if self.writer.send(line).await.is_err() {
             tracing::warn!("the log writer has stopped; a line is lost");
@@ -352,77 +258,4 @@ async fn insert_lines(
         .scope_unchecked(&scope())?
         .exec_with_returning(&conn)
         .await?)
-}
-
-pub mod migrations {
-    use sea_orm_migration::prelude::*;
-
-    #[must_use]
-    pub fn all() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(Initial)]
-    }
-
-    pub struct Initial;
-
-    impl MigrationName for Initial {
-        fn name(&self) -> &'static str {
-            "m20261120_000001_publisher_init"
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl MigrationTrait for Initial {
-        async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-            manager
-                .get_connection()
-                .execute_unprepared(
-                    "CREATE TABLE publisher_runs (
-                        run_id UUID PRIMARY KEY,
-                        started_by TEXT NOT NULL,
-                        dry_run BOOLEAN NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL,
-                        facts JSONB NOT NULL DEFAULT '{}'::jsonb
-                    );
-                    CREATE TABLE publisher_run_log (
-                        id BIGSERIAL PRIMARY KEY,
-                        run_id UUID NOT NULL,
-                        step TEXT NOT NULL,
-                        attempt INTEGER NOT NULL,
-                        stream TEXT NOT NULL,
-                        line TEXT NOT NULL,
-                        ts TIMESTAMPTZ NOT NULL
-                    );
-                    CREATE INDEX publisher_run_log_run ON publisher_run_log (run_id, id);",
-                )
-                .await?;
-            Ok(())
-        }
-
-        async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-            manager
-                .get_connection()
-                .execute_unprepared("DROP TABLE publisher_run_log; DROP TABLE publisher_runs;")
-                .await?;
-            Ok(())
-        }
-    }
-}
-
-/// In-memory journal for tests.
-#[cfg(test)]
-#[derive(Default)]
-pub struct MemoryJournal {
-    pub lines: parking_lot::Mutex<Vec<NewLine>>,
-    pub facts: parking_lot::Mutex<Vec<serde_json::Value>>,
-}
-
-#[cfg(test)]
-#[async_trait]
-impl Journal for MemoryJournal {
-    async fn log(&self, line: NewLine) {
-        self.lines.lock().push(line);
-    }
-    async fn facts(&self, _: Uuid, facts: serde_json::Value) {
-        self.facts.lock().push(facts);
-    }
 }

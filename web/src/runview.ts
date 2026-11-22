@@ -25,7 +25,10 @@ export function known(time: RecordedTime | undefined): string | undefined {
 }
 
 /** Merges progress, attempt history and facts into one row per workflow step. */
-export function stepViews(stepIds: string[], detail: RunSummary & { history?: RunHistory }): StepView[] {
+export function stepViews(
+  stepIds: string[],
+  detail: { progress: RunProgress; history?: RunHistory; record: { facts: { skipped?: string[] } } | null },
+): StepView[] {
   const { progress, history, record } = detail;
   const skipped = new Set(record?.facts.skipped ?? []);
   return stepIds.map((id) => {
@@ -122,7 +125,7 @@ export function isActive(progress: RunProgress): boolean {
 }
 
 /** The step the run is on: the first one not yet finished. */
-export function currentStep(views: StepView[]): StepView | undefined {
+export function currentStep<V extends StepView>(views: V[]): V | undefined {
   return views.find((v) => v.status !== 'succeeded' && v.status !== 'skipped');
 }
 

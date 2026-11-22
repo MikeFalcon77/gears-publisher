@@ -7,8 +7,10 @@
 //! The stream ends with an `end` event once the run is settled (finished, failed or
 //! waiting for a person), and in any case after [`MAX_LIFETIME`]: the client then
 //! reconnects with a fresh ID token, so access is re-checked regularly.
-use super::{ApiError, AppState};
-use crate::store::LiveEvent;
+use super::AppState;
+use super::dto::LogLineDto;
+use super::error::ApiError;
+use crate::domain::models::{LiveEvent, LogLine};
 use axum::{
     Extension,
     extract::{Path, Query},
@@ -59,11 +61,11 @@ fn run_event(progress: &impl serde::Serialize) -> Option<Event> {
     Event::default().event("run").json_data(progress).ok()
 }
 
-fn log_event(line: &crate::store::LogLine) -> Option<Event> {
+fn log_event(line: &LogLine) -> Option<Event> {
     Event::default()
         .event("log")
         .id(line.seq.to_string())
-        .json_data(line)
+        .json_data(LogLineDto::from(line.clone()))
         .ok()
 }
 
@@ -81,7 +83,7 @@ async fn pump(
 ) {
     let service = &app.service;
     // Subscribe before reading the backlog so that nothing falls in between.
-    let mut live = service.store.subscribe();
+    let mut live = service.subscribe();
     let mut cursor = (first.cursor, first.updated_at);
     let Some(event) = run_event(&first) else {
         return;

@@ -48,8 +48,10 @@ export interface ReleaseAttempt {
   by?: string;
   /** Who pressed Cancel during it. */
   cancelledBy?: string;
-  /** The main commit its checks ran on (`main is at` / `main moved` notes). */
+  /** The commit its checks ran on (`main is at` / `main moved` / `merge commit is at`). */
   mainSha?: string;
+  /** What `mainSha` is: `main`, or a PR's merge commit (PR CI). */
+  commitLabel?: 'main' | 'merge';
   startedAt: string;
   endedAt: string;
   sections: Section[];
@@ -57,10 +59,11 @@ export interface ReleaseAttempt {
 
 /** The service's notes on the `control` pseudo-step (service.rs). */
 const CONTROL = 'control';
-const STARTED = /^(?:dry run|release) started by (.+)$/;
+const STARTED = /^(?:dry run|release|PR #\d+ CI) started by (\S+)/;
 const REQUESTED = /^(retry|resume|cancel) requested by (.+)$/;
-/** workflow.rs: `prepare` and `checks` name the main commit the run is on. */
-const MAIN_AT = /^main (?:is at|moved: \S+ → \S+; checking) ([0-9a-f]{7,40})$/;
+/** release: `prepare` and `checks` name the main commit the run is on; PR CI's
+ * `changes` names the merge commit it tests. */
+const MAIN_AT = /^(main|merge commit) (?:is at|moved: \S+ → \S+; checking) ([0-9a-f]{7,40})$/;
 /** The engine refused a Retry/Resume that was already noted (service.rs). */
 const REJECTED = /^(retry|resume) rejected: /;
 
@@ -87,7 +90,10 @@ export class LogModel {
     release.endedAt = line.ts;
     if (line.stream === 'info') {
       const main = MAIN_AT.exec(line.line);
-      if (main) release.mainSha = main[1];
+      if (main) {
+        release.mainSha = main[2];
+        release.commitLabel = main[1] === 'main' ? 'main' : 'merge';
+      }
     }
     // Control notes of each attempt form their own section; a step attempt never spans two.
     const key = line.step === CONTROL ? `${CONTROL}@${release.number}` : `${line.step}#${line.attempt}`;
@@ -165,6 +171,7 @@ export class LogModel {
         by,
         // Until its checks say otherwise, an attempt is on the commit the last one was.
         mainSha: this.attempts[this.attempts.length - 1]?.mainSha,
+        commitLabel: this.attempts[this.attempts.length - 1]?.commitLabel,
         startedAt: line.ts,
         endedAt: line.ts,
         sections: [],
@@ -270,6 +277,8 @@ export const SKIPPED = /^… \d+ lines? skipped$/;
 /** Explanations of the publisher's own failure codes. */
 const STEP_HINTS: Record<string, string> = {
   checks_failed: 'a CI check failed; fix main, then press Retry',
+  // PR CI's verdict after all jobs ran (ci/mod.rs `conclusion`).
+  'conclusion:checks_failed': 'a job failed; push a fix to the PR, then Re-run',
   pr_closed: 'the release PR was closed without merging',
   registry_token_missing: 'CARGO_REGISTRY_TOKEN is not configured on the host',
   gh_not_logged_in: '`gh auth login` is needed on the host',
@@ -278,6 +287,10 @@ const STEP_HINTS: Record<string, string> = {
   verify_mismatch: 'crates.io or tags do not match the manifests',
   crates_io_429: 'crates.io rate limit; the step waits and retries by itself',
   pr_open: 'the release PR is still open; polling continues',
+  merge_conflict: 'the PR conflicts with its base; resolve the conflicts, then press Retry',
+  pr_not_open: 'the PR is closed or merged; CI runs on open PRs',
+  merge_ref_pending: 'GitHub has not computed the merge commit yet; retrying by itself',
+  merge_ref_stale: "GitHub's merge commit is behind the PR's head; retrying by itself",
 };
 
 type Found = Omit<Problem, 'id'>;
@@ -393,7 +406,7 @@ export function groupProblems(sections: Section[]): CommandProblems[] {
       const note: StepNote = {
         code: failed[2],
         title: `${failed[1]} failed: ${failed[2]}`,
-        hint: STEP_HINTS[failed[2]],
+        hint: STEP_HINTS[`${failed[1]}:${failed[2]}`] ?? STEP_HINTS[failed[2]],
         seq: item.line.seq,
       };
       if (lastFailed) {

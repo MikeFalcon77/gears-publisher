@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
 
-export type Route = { page: 'runs' } | { page: 'run'; id: string };
+export type Route = { page: 'runs' } | { page: 'ci' } | { page: 'run'; id: string };
 
 export function parse(pathname: string): Route {
   const match = /^\/runs\/([0-9a-f-]{36})\/?$/i.exec(pathname);
-  return match ? { page: 'run', id: match[1].toLowerCase() } : { page: 'runs' };
+  if (match) return { page: 'run', id: match[1].toLowerCase() };
+  if (/^\/ci\/?$/.test(pathname)) return { page: 'ci' };
+  return { page: 'runs' };
 }
 
 export function navigate(path: string): void {

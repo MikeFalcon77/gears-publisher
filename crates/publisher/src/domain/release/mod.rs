@@ -13,10 +13,11 @@
 //! The contract (step ids, timeouts, retry policies) is stored with the registration;
 //! changing it requires a new workflow name (`gears-release.v2`). Intervals that do
 //! not belong to the contract come from [`Timings`].
+pub mod crates_io;
+
 use crate::config::{PublisherConfig, Timings};
-use crate::crates_io::{self, Registry};
-use crate::runner::{Cmd, CmdOutput, Exec, ExecError, StepScope};
-use crate::store::Journal;
+use crate::domain::ports::{Cmd, CmdOutput, Exec, Journal, Registry, StepScope};
+use crate::domain::steps::{self, BuildSlot, cancellable_sleep, git_auth, last_json};
 use chrono::Utc;
 use futures_util::StreamExt;
 use secrecy::SecretString;
@@ -26,8 +27,8 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use toolkit_durable_execution::DefinitionError;
 use toolkit_durable_execution::prelude::*;
-use toolkit_durable_execution::{DefinitionError, workflow::Payload};
 
 pub const WORKFLOW: &str = "gears-release.v1";
 
@@ -148,6 +149,8 @@ pub struct Deps {
     pub exec: Arc<dyn Exec>,
     pub journal: Arc<dyn Journal>,
     pub registry: Arc<dyn Registry>,
+    /// Shared with PR CI: one heavy build at a time.
+    pub slot: Arc<BuildSlot>,
 }
 
 type StepResult = Result<ReleaseState, ActivityError>;
@@ -230,7 +233,7 @@ pub fn definition(
         .build()
 }
 
-/// Wrap a step function: scope, start/finish notes and facts.
+/// A release step bound to `deps`.
 fn step<I, F, Fut>(
     deps: &Arc<Deps>,
     id: &'static str,
@@ -239,58 +242,15 @@ fn step<I, F, Fut>(
     f: F,
 ) -> Step<I, ReleaseState>
 where
-    I: Payload,
+    I: toolkit_durable_execution::workflow::Payload,
     F: Fn(Arc<Deps>, StepScope, I) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = StepResult> + Send + 'static,
 {
-    let deps = Arc::clone(deps);
-    Step::new(id, timeout, move |ctx: ActivityContext, input: I| {
-        let deps = Arc::clone(&deps);
-        let scope = StepScope {
-            run_id: ctx.run_id().0,
-            step: id.to_owned(),
-            attempt: ctx.attempt(),
-            cancel: ctx.cancellation().clone(),
-            journal: Arc::clone(&deps.journal),
-        };
-        let work = f(Arc::clone(&deps), scope.clone(), input);
-        async move {
-            scope
-                .info(format!("{id}: attempt {} started", scope.attempt))
-                .await;
-            let result = work.await;
-            match &result {
-                Ok(state) => {
-                    scope.info(format!("{id}: done")).await;
-                    if let Ok(facts) = serde_json::to_value(state) {
-                        deps.journal.facts(scope.run_id, facts).await;
-                    }
-                }
-                Err(ActivityError::Retryable { code, retry_after }) => {
-                    let when = retry_after
-                        .map(|d| format!(" in at least {}s", d.as_secs()))
-                        .unwrap_or_default();
-                    scope
-                        .info(format!("{id}: failed ({code}), will retry{when}"))
-                        .await;
-                }
-                Err(error) => scope.info(format!("{id}: failed ({error})")).await,
-            }
-            result
-        }
-    })
-    .retry(retry)
+    steps::step(deps, &deps.journal, id, timeout, retry, f)
 }
 
 // ---------------------------------------------------------------------------------
 // Helpers
-
-fn exec_error(error: &ExecError) -> ActivityError {
-    match error {
-        ExecError::Cancelled => ActivityError::Cancelled,
-        ExecError::Spawn { .. } | ExecError::Io { .. } => ActivityError::retryable("spawn_failed"),
-    }
-}
 
 impl Deps {
     fn clone_dir(&self) -> PathBuf {
@@ -319,22 +279,9 @@ impl Deps {
         cmd.env("CARGO_TARGET_DIR", &self.config.target_dir)
     }
 
-    /// A command that ends because the run is cancelled or the service stops, or that
-    /// was killed by a signal, is an interruption, never a verdict on the release.
+    /// See [`steps::run`].
     async fn run(&self, scope: &StepScope, cmd: Cmd) -> Result<CmdOutput, ActivityError> {
-        let out = self
-            .exec
-            .run(scope, cmd)
-            .await
-            .map_err(|e| exec_error(&e))?;
-        if scope.cancel.is_cancelled() {
-            return Err(ActivityError::Cancelled);
-        }
-        if out.code.is_none() {
-            scope.info("the command was killed by a signal").await;
-            return Err(ActivityError::retryable("killed"));
-        }
-        Ok(out)
+        steps::run(self.exec.as_ref(), scope, cmd).await
     }
 
     /// Run and require exit 0; otherwise fail with `code`.
@@ -345,55 +292,24 @@ impl Deps {
         fail: fn(&'static str) -> ActivityError,
         code: &'static str,
     ) -> Result<CmdOutput, ActivityError> {
-        let out = self.run(scope, cmd).await?;
-        if out.success() {
-            Ok(out)
-        } else {
-            Err(fail(code))
-        }
+        steps::run_ok(self.exec.as_ref(), scope, cmd, fail, code).await
     }
 
-    /// `gh` runs as the service (it holds the GitHub login) and outside the clone.
     fn gh(&self) -> Cmd {
-        Cmd::new(&self.config.gh_bin, "/").trusted()
+        steps::gh(&self.config)
     }
 
     async fn gh_token(&self, scope: &StepScope) -> Result<SecretString, ActivityError> {
-        let out = self
-            .run_ok(
-                scope,
-                self.gh().args(["auth", "token"]).quiet(),
-                ActivityError::retryable,
-                "gh_not_logged_in",
-            )
-            .await?;
-        let token = out.stdout.trim();
-        if token.is_empty() {
-            return Err(ActivityError::retryable("gh_not_logged_in"));
-        }
-        Ok(SecretString::from(token.to_owned()))
+        steps::gh_token(self.exec.as_ref(), &self.config, scope).await
     }
 
     /// `CARGO_REGISTRY_TOKEN` from the secrets file, or from the environment.
     fn registry_token(&self) -> Option<SecretString> {
-        if let Some(path) = &self.config.secrets_file
-            && let Ok(text) = std::fs::read_to_string(path)
-            && let Some(token) = env_file_value(&text, "CARGO_REGISTRY_TOKEN")
-        {
-            return Some(SecretString::from(token));
-        }
-        std::env::var("CARGO_REGISTRY_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty())
-            .map(SecretString::from)
+        steps::secret(&self.config, "CARGO_REGISTRY_TOKEN")
     }
 
-    /// GitHub refuses anonymous git reads of gears-rust, and the build user has no
-    /// credential helper (the gh login stays with the service). Like actions/checkout,
-    /// git gets the token as an `http.extraheader` through `GIT_CONFIG_*` variables:
-    /// in the environment of that one command, never on disk or in its arguments.
-    /// Not for release-plz, which authenticates with `GIT_TOKEN` itself (two
-    /// `Authorization` headers are rejected).
+    /// The service's token for git itself (see [`git_auth`]); never for checks of
+    /// someone else's code.
     async fn with_git_auth(&self, scope: &StepScope, cmd: Cmd) -> Result<Cmd, ActivityError> {
         Ok(git_auth(cmd, &self.gh_token(scope).await?))
     }
@@ -524,28 +440,6 @@ enum Tree {
     Release,
 }
 
-/// `KEY=value` lookup in an env file (`export`, quotes and comments allowed).
-#[must_use]
-pub fn env_file_value(text: &str, key: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        let line = line.trim();
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        let (k, v) = line.split_once('=')?;
-        if k.trim() != key {
-            return None;
-        }
-        let v = v.trim().trim_matches('"').trim_matches('\'');
-        (!v.is_empty()).then(|| v.to_owned())
-    })
-}
-
-async fn cancellable_sleep(scope: &StepScope, duration: Duration) -> Result<(), ActivityError> {
-    tokio::select! {
-        () = tokio::time::sleep(duration) => Ok(()),
-        () = scope.cancel.cancelled() => Err(ActivityError::Cancelled),
-    }
-}
-
 // ---------------------------------------------------------------------------------
 // Steps
 
@@ -606,20 +500,6 @@ async fn prepare(deps: Arc<Deps>, scope: StepScope, input: ReleaseInput) -> Step
 }
 
 /// The configured check commands (gears-rust's CI). A failure stops the run until Retry.
-/// The token as git's `http.extraheader` (see [`Deps::with_git_auth`]).
-fn git_auth(cmd: Cmd, token: &SecretString) -> Cmd {
-    use base64::Engine as _;
-    use secrecy::ExposeSecret as _;
-    let basic = base64::engine::general_purpose::STANDARD
-        .encode(format!("x-access-token:{}", token.expose_secret()));
-    cmd.env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
-        .secret(
-            "GIT_CONFIG_VALUE_0",
-            SecretString::from(format!("AUTHORIZATION: basic {basic}")),
-        )
-}
-
 async fn checks(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState) -> StepResult {
     follow_main(&deps, &scope, &mut state).await?;
     deps.ensure_tree(&scope, &state, Tree::Main).await?;
@@ -629,6 +509,7 @@ async fn checks(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState) -> S
     // fetches with the git CLI. The token is already given to main's code by
     // `release-plz release`; never give it to PR checks.
     let token = deps.gh_token(&scope).await?;
+    let _slot = deps.slot.acquire(&scope, "release checks".into()).await?;
     for check in &deps.config.checks {
         let mut words = check.split_whitespace();
         let Some(program) = words.next() else {
@@ -737,6 +618,10 @@ async fn release_pr(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState) 
 
     deps.ensure_tree(&scope, &state, Tree::Main).await?;
     let token = deps.gh_token(&scope).await?;
+    let _slot = deps
+        .slot
+        .acquire(&scope, "release-plz release-pr".into())
+        .await?;
     let out = deps
         .run_ok(
             &scope,
@@ -1000,7 +885,12 @@ async fn release_attempt(
             .secret("CARGO_REGISTRY_TOKEN", registry_token)
             .secret("GIT_TOKEN", gh);
     }
+    let slot = deps
+        .slot
+        .acquire(scope, "release-plz release".into())
+        .await?;
     let out = deps.run(scope, deps.cargo_env(cmd)).await?;
+    drop(slot);
     let _ = std::fs::write(dir.join(format!("release-{attempt}.json")), &out.stdout);
     let record = |outcome: &str| {
         let _ = std::fs::write(outcome_path(dir, attempt), outcome);
@@ -1416,16 +1306,5 @@ pub fn git_only_packages(release_plz_toml: &str) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// The last line of `stdout` that parses as `T` (release-plz may print other lines).
-fn last_json<T: serde::de::DeserializeOwned>(stdout: &str) -> Option<T> {
-    stdout
-        .lines()
-        .rev()
-        .filter(|l| l.trim_start().starts_with('{'))
-        .find_map(|l| serde_json::from_str(l).ok())
-        .or_else(|| serde_json::from_str(stdout.trim()).ok())
-}
-
 #[cfg(test)]
-#[path = "workflow_tests.rs"]
 mod tests;
