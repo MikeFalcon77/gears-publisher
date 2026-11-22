@@ -125,12 +125,16 @@ install -d -o publisher -g publisher -m 0755 "$APP/src"
 install -d -o publisher-build -g publisher-build -m 2775 "$WORK"
 chown -R publisher-build:publisher-build "$WORK"
 install -d -o publisher -g publisher-build -m 2775 "$WORK/runs"
+# Each build user's own TMPDIR (publisher.tmp_dir / ci_tmp_dir): under the service's
+# PrivateTmp both share one /tmp, and PR code must not leave files the release uses.
+install -d -o publisher-build -g publisher-build -m 0700 "$WORK/tmp"
 id publisher-ci >/dev/null 2>&1 \
   || useradd --system --create-home --home-dir "$CI_HOME" --shell /usr/sbin/nologin publisher-ci
 # 0751: the service starts PR CI commands in $CI_HOME/work, so it must traverse the
 # home; it still cannot list it.
 chmod 0751 "$CI_HOME"
 install -d -o publisher-ci -g publisher-ci -m 0755 "$CI_HOME/work"
+install -d -o publisher-ci -g publisher-ci -m 0700 "$CI_HOME/work/tmp"
 install -d -o publisher -g publisher -m 0755 "$MIRROR"
 install -d -o root -g publisher -m 0750 "$ETC"
 if [[ -f "$ETC/secrets.env" ]]; then

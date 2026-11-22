@@ -198,6 +198,16 @@ impl PublisherConfig {
     pub fn ci_target_dir(&self) -> PathBuf {
         self.ci_work_dir().join("target")
     }
+    /// `TMPDIR` of the release's build user (made by `deploy/provision.sh`).
+    #[must_use]
+    pub fn tmp_dir(&self) -> PathBuf {
+        PathBuf::from(&self.work_dir).join("tmp")
+    }
+    /// `TMPDIR` of the PR CI build user (made by `deploy/provision.sh`).
+    #[must_use]
+    pub fn ci_tmp_dir(&self) -> PathBuf {
+        self.ci_work_dir().join("tmp")
+    }
     /// The service's bare mirror the CI clone fetches PRs from.
     #[must_use]
     pub fn ci_mirror_dir(&self) -> PathBuf {

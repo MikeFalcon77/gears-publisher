@@ -53,6 +53,10 @@ pub struct ProcessExec {
 pub struct RunAs {
     pub user: String,
     pub sudo: String,
+    /// `TMPDIR` of the user's commands. Under the service's `PrivateTmp` both build
+    /// users share one `/tmp`: a fixed path there made by one user is not writable by
+    /// the other, and PR code could plant files the release then uses.
+    pub tmp_dir: Option<String>,
 }
 
 enum Chunk {
@@ -122,8 +126,14 @@ impl ProcessExec {
             Some(run_as) => {
                 // sudo resets the environment and sets PATH (secure_path) and HOME for
                 // the build user; the names listed here are passed through.
+                if let Some(tmp) = &run_as.tmp_dir {
+                    vars.push(("TMPDIR".to_owned(), tmp.clone()));
+                }
                 let mut names: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
                 names.retain(|n| !INHERITED_ENV.contains(n));
+                if run_as.tmp_dir.is_some() {
+                    names.push("TMPDIR");
+                }
                 names.sort_unstable();
                 names.dedup();
                 let mut c = tokio::process::Command::new(&run_as.sudo);
@@ -538,13 +548,14 @@ mod tests {
             run_as: Some(RunAs {
                 user: "build".into(),
                 sudo: sudo.display().to_string(),
+                tmp_dir: Some("/build/tmp".into()),
             }),
         };
         let out = exec
             .run(
                 &scope(Arc::new(MemoryJournal::default())),
                 Cmd::new("sh", ".")
-                    .args(["-c", "echo \"$TOKEN|$HEADER|$PLAIN\"; cat"])
+                    .args(["-c", "echo \"$TOKEN|$HEADER|$PLAIN|$TMPDIR\"; cat"])
                     .env("PLAIN", "plain")
                     .secret("TOKEN", SecretString::from("abcdef123"))
                     .secret("HEADER", SecretString::from("AUTHORIZATION: basic xyz789"))
@@ -554,9 +565,18 @@ mod tests {
             .unwrap();
         // The command gets the secrets, and its stdin is empty as before.
         assert_eq!(out.code, Some(0));
-        assert_eq!(out.stdout, "abcdef123|AUTHORIZATION: basic xyz789|plain\n");
+        assert_eq!(
+            out.stdout,
+            "abcdef123|AUTHORIZATION: basic xyz789|plain|/build/tmp\n"
+        );
         let saw = std::fs::read_to_string(&record).unwrap();
         assert!(saw.contains("--preserve-env="), "{saw}");
+        // sudo resets the environment: TMPDIR is passed on explicitly.
+        assert!(
+            saw.lines()
+                .any(|l| l.starts_with("--preserve-env=") && l.contains("TMPDIR")),
+            "{saw}"
+        );
         assert!(saw.contains("PLAIN=plain"), "{saw}");
         assert!(!saw.contains("abcdef123"), "{saw}");
         assert!(!saw.contains("xyz789"), "{saw}");

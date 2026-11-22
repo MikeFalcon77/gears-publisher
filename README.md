@@ -244,6 +244,10 @@ limits leave room for that (failed checks and repeated publish errors stop the r
   the service's bare mirror (`/var/lib/gears-publisher-mirror`) with the gh token, by git
   running as the service; the CI clone fetches from that mirror without credentials. Checks get
   only `GITHUB_CI_TOKEN`. With `run_as` set and no `ci_run_as`, PR CI is refused.
+- Each build user has its own `TMPDIR` (`<work_dir>/tmp`, `<ci_work_dir>/tmp`, 0700): under
+  the service's `PrivateTmp` both share one `/tmp`, where a fixed path made by one user is not
+  writable by the other (toolkit-db's `cf_gears_test_locks`) and PR code could leave files a
+  release then uses.
 - What remains: those commands build crates (`cargo publish` verifies), so a malicious
   dependency could read the two tokens from its environment during a release, as in GitHub
   Actions. With a personal `gh` login that token reaches all of its owner's repositories; a

@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use sea_orm_migration::MigrationTrait;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -51,13 +51,26 @@ impl DatabaseCapability for PublisherGear {
     }
 }
 
-fn process_exec(config: &PublisherConfig, user: Option<&str>) -> ProcessExec {
-    ProcessExec {
-        base_env: config.env.clone(),
-        run_as: user.map(|user| RunAs {
+/// Commands as `user` (none: as the service), with `tmp_dir` as their own `TMPDIR`.
+fn process_exec(config: &PublisherConfig, user: Option<&str>, tmp_dir: &Path) -> ProcessExec {
+    let run_as = user.map(|user| {
+        let own_tmp = tmp_dir.is_dir().then(|| tmp_dir.display().to_string());
+        if own_tmp.is_none() {
+            tracing::warn!(
+                user,
+                tmp_dir = %tmp_dir.display(),
+                "no TMPDIR of its own: the build users share /tmp (run deploy/provision.sh)"
+            );
+        }
+        RunAs {
             user: user.to_owned(),
             sudo: config.sudo_bin.clone(),
-        }),
+            tmp_dir: own_tmp,
+        }
+    });
+    ProcessExec {
+        base_env: config.env.clone(),
+        run_as,
     }
 }
 
@@ -90,7 +103,11 @@ impl Gear for PublisherGear {
         let journal = Arc::clone(&repo) as Arc<dyn Journal>;
         let slot = Arc::new(BuildSlot::default());
         let release = Arc::new(Deps {
-            exec: Arc::new(process_exec(&config, config.build_user())),
+            exec: Arc::new(process_exec(
+                &config,
+                config.build_user(),
+                &config.tmp_dir(),
+            )),
             journal: Arc::clone(&journal),
             registry: Arc::new(SparseIndex::new(config.crates_index_url.clone())?),
             slot: Arc::clone(&slot),
@@ -98,8 +115,16 @@ impl Gear for PublisherGear {
         });
         // A CI run recovered after PR CI was disabled must not run the PR as the service.
         let ci_exec: Arc<dyn Exec> = match ci_refusal {
-            None => Arc::new(process_exec(&config, config.ci_user())),
-            Some(_) => Arc::new(RefuseUntrusted(process_exec(&config, None))),
+            None => Arc::new(process_exec(
+                &config,
+                config.ci_user(),
+                &config.ci_tmp_dir(),
+            )),
+            Some(_) => Arc::new(RefuseUntrusted(process_exec(
+                &config,
+                None,
+                &config.ci_tmp_dir(),
+            ))),
         };
         let ci = Arc::new(CiDeps {
             exec: ci_exec,
