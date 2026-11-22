@@ -33,6 +33,11 @@ const MAX_LINE_BYTES: u64 = 64 * 1024;
 const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 /// Variables of the service's own environment that commands may see.
 const INHERITED_ENV: [&str; 7] = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "TMPDIR", "TZ"];
+/// Run as the build user, exports the `NAME=value` lines of stdin, then runs the
+/// command (`"$@"`) with stdin closed. sudo logs the variables it passes, values
+/// included, to the journal and auth.log; secrets therefore never go through sudo.
+const EXPORT_STDIN: &str =
+    r#"while IFS= read -r kv; do export "$kv" || exit 126; done; exec "$@" </dev/null"#;
 
 /// Real subprocesses.
 pub struct ProcessExec {
@@ -87,7 +92,9 @@ impl ProcessExec {
         self.run_as.as_ref().filter(|_| !cmd.trusted)
     }
 
-    fn command(&self, cmd: &Cmd) -> tokio::process::Command {
+    /// The process to spawn, and for a build-user command with secrets the
+    /// `NAME=value` lines to write to its stdin (see [`EXPORT_STDIN`]).
+    fn command(&self, cmd: &Cmd) -> (tokio::process::Command, Option<String>) {
         let mut vars: Vec<(String, String)> = [
             ("CARGO_TERM_COLOR", "never"),
             ("NO_COLOR", "1"),
@@ -99,13 +106,15 @@ impl ProcessExec {
         .collect();
         vars.extend(self.base_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         vars.extend(cmd.env.iter().cloned());
-        let secrets = cmd
-            .secrets
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.expose_secret()));
-
+        let mut secrets: Vec<(&str, &str)> = Vec::new();
+        let mut stdin = None;
         let mut command = match self.run_as(cmd) {
             None => {
+                secrets.extend(
+                    cmd.secrets
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.expose_secret())),
+                );
                 let mut c = tokio::process::Command::new(&cmd.program);
                 c.args(&cmd.args);
                 c
@@ -114,7 +123,6 @@ impl ProcessExec {
                 // sudo resets the environment and sets PATH (secure_path) and HOME for
                 // the build user; the names listed here are passed through.
                 let mut names: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
-                names.extend(cmd.secrets.iter().map(|(k, _)| k.as_str()));
                 names.retain(|n| !INHERITED_ENV.contains(n));
                 names.sort_unstable();
                 names.dedup();
@@ -123,13 +131,32 @@ impl ProcessExec {
                 if !names.is_empty() {
                     c.arg(format!("--preserve-env={}", names.join(",")));
                 }
-                c.arg("--").arg(&cmd.program).args(&cmd.args);
+                c.arg("--");
+                if !cmd.secrets.is_empty() {
+                    // A value with a newline would split into two variables; tokens
+                    // have none, so such a value is dropped rather than mangled.
+                    let mut lines = String::new();
+                    for (k, v) in &cmd.secrets {
+                        if !v.expose_secret().contains('\n') {
+                            for part in [k.as_str(), "=", v.expose_secret(), "\n"] {
+                                lines.push_str(part);
+                            }
+                        }
+                    }
+                    stdin = Some(lines);
+                    c.args(["/bin/sh", "-c", EXPORT_STDIN, "sh"]);
+                }
+                c.arg(&cmd.program).args(&cmd.args);
                 c
             }
         };
         command
             .current_dir(&cmd.cwd)
-            .stdin(Stdio::null())
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -143,7 +170,7 @@ impl ProcessExec {
             .envs(secrets);
         #[cfg(unix)]
         command.process_group(0);
-        command
+        (command, stdin)
     }
 }
 
@@ -153,12 +180,13 @@ impl Exec for ProcessExec {
         let masker = Masker::new(cmd.secrets.iter().map(|(_, v)| v.expose_secret()));
         log(scope, "cmd", format!("$ {}", masker.mask(&cmd.display()))).await;
 
-        let mut command = self.command(&cmd);
+        let (mut command, secrets) = self.command(&cmd);
         let mut child = command.spawn().map_err(|source| ExecError::Spawn {
             program: cmd.program.clone(),
             source,
         })?;
         let pid = child.id();
+        feed(&mut child, secrets);
 
         let (tx, mut rx) = mpsc::channel::<Chunk>(1024);
         let stdout = child.stdout.take().map(|out| {
@@ -281,6 +309,17 @@ impl Exec for RefuseUntrusted {
             program: cmd.program,
             source: std::io::Error::other("PR CI is disabled"),
         })
+    }
+}
+
+/// Writes the secrets to the command's stdin (see [`EXPORT_STDIN`]). A command that
+/// exits before reading them gets them no more.
+fn feed(child: &mut tokio::process::Child, secrets: Option<String>) {
+    if let (Some(secrets), Some(mut stdin)) = (secrets, child.stdin.take()) {
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            let _ = stdin.write_all(secrets.as_bytes()).await;
+        });
     }
 }
 
@@ -471,6 +510,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.stdout, "none base own\n");
+    }
+
+    #[tokio::test]
+    async fn secrets_reach_the_build_user_without_passing_through_sudo() {
+        // A stand-in for sudo: records what it gets, as sudo's log would, then runs
+        // the command after `--` like sudo.
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("sudo-saw");
+        let sudo = dir.path().join("sudo");
+        std::fs::write(
+            &sudo,
+            format!(
+                "#!/bin/sh\n{{ printf '%s\\n' \"$@\"; env; }} > '{}'\n\
+                 while [ \"$1\" != -- ]; do shift; done; shift\nexec \"$@\"\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let exec = ProcessExec {
+            base_env: HashMap::new(),
+            run_as: Some(RunAs {
+                user: "build".into(),
+                sudo: sudo.display().to_string(),
+            }),
+        };
+        let out = exec
+            .run(
+                &scope(Arc::new(MemoryJournal::default())),
+                Cmd::new("sh", ".")
+                    .args(["-c", "echo \"$TOKEN|$HEADER|$PLAIN\"; cat"])
+                    .env("PLAIN", "plain")
+                    .secret("TOKEN", SecretString::from("abcdef123"))
+                    .secret("HEADER", SecretString::from("AUTHORIZATION: basic xyz789"))
+                    .capture(),
+            )
+            .await
+            .unwrap();
+        // The command gets the secrets, and its stdin is empty as before.
+        assert_eq!(out.code, Some(0));
+        assert_eq!(out.stdout, "abcdef123|AUTHORIZATION: basic xyz789|plain\n");
+        let saw = std::fs::read_to_string(&record).unwrap();
+        assert!(saw.contains("--preserve-env="), "{saw}");
+        assert!(saw.contains("PLAIN=plain"), "{saw}");
+        assert!(!saw.contains("abcdef123"), "{saw}");
+        assert!(!saw.contains("xyz789"), "{saw}");
+        assert!(!saw.contains("TOKEN="), "{saw}");
     }
 
     fn condense(input: &[&str]) -> Vec<String> {

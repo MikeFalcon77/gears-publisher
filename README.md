@@ -42,11 +42,12 @@ Taken from `release-plz.yml`:
 - Go 1.21.13 (FIPS) and protoc 34.1 are pinned on the host; cargo-semver-checks needs both.
 - dylint's hard-coded rust-clippy `master` is served from a local mirror, as ci.yml does.
 - GitHub refuses anonymous reads of the organization's repositories, so git gets the `gh`
-  token as an `http.extraheader` (in the command's environment, never on disk) for the
+  token as an `http.extraheader` (in the command's environment, never on disk or in a log) for the
   clone, tag fetches and every `checks` command; in `checks` cargo fetches git dependencies
   with the git CLI (`CARGO_NET_GIT_FETCH_WITH_CLI`), because its libgit2 ignores that
   header (`make dylint` builds its lints from cargo-gears). release-plz authenticates with
-  `GIT_TOKEN` itself.
+  `GIT_TOKEN` itself. Secrets reach the build user's commands through stdin, not through
+  sudo, which would log them with their values to the journal and auth.log.
 
 Not taken: no GitHub App token (the host's `gh` login is used). Docker images and Helm charts
 (`plan-publish`/`publish`) are still published only by Actions.
