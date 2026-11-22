@@ -68,6 +68,10 @@ pub struct PublisherConfig {
     /// copy, e.g. a public fork, when no CI token can read the original.
     #[serde(default)]
     pub ci_git_rewrites: BTreeMap<String, String>,
+    /// Below this much free disk (GiB) on a build's filesystem, the build's own
+    /// `target/debug` is removed before it starts.
+    #[serde(default = "defaults::min_free_disk_gb")]
+    pub min_free_disk_gb: u64,
     /// Commands of the `checks` step, run in order in the clone (split on whitespace;
     /// `make` resolves to `make_bin`). The default follows the jobs of gears-rust's
     /// `ci.yml` that need no Docker.
@@ -268,6 +272,9 @@ mod defaults {
     }
     pub fn cargo() -> String {
         "cargo".into()
+    }
+    pub fn min_free_disk_gb() -> u64 {
+        80
     }
     pub fn checks() -> Vec<String> {
         [

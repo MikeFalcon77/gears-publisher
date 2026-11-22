@@ -17,7 +17,9 @@ pub mod crates_io;
 
 use crate::config::{PublisherConfig, Timings};
 use crate::domain::ports::{Cmd, CmdOutput, Exec, Journal, Registry, StepScope};
-use crate::domain::steps::{self, BuildSlot, cancellable_sleep, git_auth, last_json};
+use crate::domain::steps::{
+    self, BuildGuard, BuildSlot, Builder, cancellable_sleep, git_auth, last_json,
+};
 use chrono::Utc;
 use futures_util::StreamExt;
 use secrecy::SecretString;
@@ -276,7 +278,9 @@ impl Deps {
 
     /// Tools that build the workspace share one target directory.
     fn cargo_env(&self, cmd: Cmd) -> Cmd {
+        // As gears-rust's CI: incremental artifacts only fill the disk (97 GiB here).
         cmd.env("CARGO_TARGET_DIR", &self.config.target_dir)
+            .env("CARGO_INCREMENTAL", "0")
     }
 
     /// See [`steps::run`].
@@ -339,6 +343,26 @@ impl Deps {
         )
         .await
         .map(drop)
+    }
+
+    /// The build slot (release builds go first), then room on the disk.
+    async fn build_slot(
+        &self,
+        scope: &StepScope,
+        what: &str,
+    ) -> Result<BuildGuard<'_>, ActivityError> {
+        let guard = self
+            .slot
+            .acquire(scope, what.to_owned(), Builder::Release)
+            .await?;
+        steps::make_room(
+            self.exec.as_ref(),
+            scope,
+            Path::new(&self.config.target_dir),
+            self.config.min_free_disk_gb,
+        )
+        .await;
+        Ok(guard)
     }
 
     /// Remove a path owned by the build user (as that user).
@@ -509,7 +533,7 @@ async fn checks(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState) -> S
     // fetches with the git CLI. The token is already given to main's code by
     // `release-plz release`; never give it to PR checks.
     let token = deps.gh_token(&scope).await?;
-    let _slot = deps.slot.acquire(&scope, "release checks".into()).await?;
+    let _slot = deps.build_slot(&scope, "release checks").await?;
     for check in &deps.config.checks {
         let mut words = check.split_whitespace();
         let Some(program) = words.next() else {
@@ -618,10 +642,7 @@ async fn release_pr(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState) 
 
     deps.ensure_tree(&scope, &state, Tree::Main).await?;
     let token = deps.gh_token(&scope).await?;
-    let _slot = deps
-        .slot
-        .acquire(&scope, "release-plz release-pr".into())
-        .await?;
+    let _slot = deps.build_slot(&scope, "release-plz release-pr").await?;
     let out = deps
         .run_ok(
             &scope,
@@ -885,10 +906,7 @@ async fn release_attempt(
             .secret("CARGO_REGISTRY_TOKEN", registry_token)
             .secret("GIT_TOKEN", gh);
     }
-    let slot = deps
-        .slot
-        .acquire(scope, "release-plz release".into())
-        .await?;
+    let slot = deps.build_slot(scope, "release-plz release").await?;
     let out = deps.run(scope, deps.cargo_env(cmd)).await?;
     drop(slot);
     let _ = std::fs::write(dir.join(format!("release-{attempt}.json")), &out.stdout);

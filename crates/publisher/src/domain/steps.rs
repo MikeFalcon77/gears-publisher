@@ -5,10 +5,12 @@ use crate::domain::ports::{Cmd, CmdOutput, Exec, ExecError, Journal, StepScope};
 use parking_lot::Mutex;
 use secrecy::SecretString;
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::future::Future;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::Notify;
 use toolkit_durable_execution::prelude::*;
 use toolkit_durable_execution::workflow::Payload;
 
@@ -229,66 +231,190 @@ pub fn last_json<T: serde::de::DeserializeOwned>(stdout: &str) -> Option<T> {
 }
 
 /// One heavy build at a time on the host. Release checks and a PR's CI each start
-/// `CARGO_BUILD_JOBS` compilers; together they run the host out of memory. The
-/// queue is first come, first served.
+/// `CARGO_BUILD_JOBS` compilers; together they run the host out of memory. A
+/// waiting release build goes first: a half-published release should not wait
+/// behind a PR's tests. Otherwise first come, first served.
+#[derive(Default)]
 pub struct BuildSlot {
-    permits: Semaphore,
-    holder: Mutex<Option<String>>,
+    state: Mutex<SlotState>,
+    freed: Notify,
 }
 
-impl Default for BuildSlot {
-    fn default() -> Self {
-        Self {
-            permits: Semaphore::new(1),
-            holder: Mutex::new(None),
-        }
-    }
+#[derive(Default)]
+struct SlotState {
+    holder: Option<String>,
+    /// Release builds waiting for the slot: PR CI does not take it meanwhile.
+    releases_waiting: usize,
+    /// Waiters in arrival order; the first eligible one takes the slot.
+    queue: VecDeque<u64>,
+    next_ticket: u64,
+}
+
+/// Who asks for the build slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Builder {
+    Release,
+    PrCi,
 }
 
 /// Holds the slot until dropped.
 pub struct BuildGuard<'a> {
     slot: &'a BuildSlot,
-    _permit: SemaphorePermit<'a>,
 }
 
 impl Drop for BuildGuard<'_> {
     fn drop(&mut self) {
-        *self.slot.holder.lock() = None;
+        self.slot.state.lock().holder = None;
+        self.slot.freed.notify_waiters();
+    }
+}
+
+/// Leaves the queue when a waiter stops waiting (cancelled or done).
+struct Waiting<'a> {
+    slot: &'a BuildSlot,
+    ticket: u64,
+    builder: Builder,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let mut state = self.slot.state.lock();
+        state.queue.retain(|t| *t != self.ticket);
+        if self.builder == Builder::Release {
+            state.releases_waiting -= 1;
+        }
+        drop(state);
+        // The next waiter may be eligible now.
+        self.slot.freed.notify_waiters();
+    }
+}
+
+impl SlotState {
+    /// Whether `ticket` of `builder` may take the free slot now.
+    fn eligible(&self, ticket: u64, builder: Builder) -> bool {
+        if self.holder.is_some() {
+            return false;
+        }
+        match builder {
+            // The earliest waiting release build.
+            Builder::Release => true,
+            Builder::PrCi => self.releases_waiting == 0 && self.queue.front() == Some(&ticket),
+        }
     }
 }
 
 impl BuildSlot {
+    /// Takes the free slot for `ticket` if it is its turn.
+    fn take(&self, ticket: u64, builder: Builder, what: &str) -> bool {
+        let mut state = self.state.lock();
+        let eligible = state.eligible(ticket, builder);
+        if eligible {
+            state.holder = Some(what.to_owned());
+        }
+        eligible
+    }
+
     /// Waits for the slot; `what` names the holder in other runs' logs.
     pub async fn acquire(
         &self,
         scope: &StepScope,
         what: String,
+        builder: Builder,
     ) -> Result<BuildGuard<'_>, ActivityError> {
-        let permit = if let Ok(permit) = self.permits.try_acquire() {
-            permit
-        } else {
-            let holder = self
-                .holder
-                .lock()
-                .clone()
-                .unwrap_or_else(|| "another run".to_owned());
-            scope
-                .info(format!("waiting for the build host: {holder} is building"))
-                .await;
-            let permit = tokio::select! {
-                permit = self.permits.acquire() => {
-                    permit.map_err(|_| ActivityError::retryable("build_slot_closed"))?
-                }
-                () = scope.cancel.cancelled() => return Err(ActivityError::Cancelled),
+        let ticket = {
+            let mut state = self.state.lock();
+            let first = match builder {
+                Builder::Release => true,
+                Builder::PrCi => state.queue.is_empty() && state.releases_waiting == 0,
             };
-            scope.info("the build host is free").await;
-            permit
+            if state.holder.is_none() && first {
+                state.holder = Some(what);
+                return Ok(BuildGuard { slot: self });
+            }
+            let ticket = state.next_ticket;
+            state.next_ticket += 1;
+            state.queue.push_back(ticket);
+            if builder == Builder::Release {
+                state.releases_waiting += 1;
+            }
+            ticket
         };
-        *self.holder.lock() = Some(what);
-        Ok(BuildGuard {
+        let waiting = Waiting {
             slot: self,
-            _permit: permit,
-        })
+            ticket,
+            builder,
+        };
+        let holder = self
+            .state
+            .lock()
+            .holder
+            .clone()
+            .unwrap_or_else(|| "a release build is waiting".to_owned());
+        scope
+            .info(format!("waiting for the build host: {holder} is building"))
+            .await;
+        loop {
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            if self.take(ticket, builder, &what) {
+                drop(waiting);
+                scope.info("the build host is free").await;
+                return Ok(BuildGuard { slot: self });
+            }
+            tokio::select! {
+                () = &mut freed => {}
+                () = scope.cancel.cancelled() => return Err(ActivityError::Cancelled),
+            }
+        }
+    }
+}
+
+/// Before a heavy build: when the filesystem of `target` has less than `min_free_gb`
+/// left, removes the build's own `target/debug` (the slot is held, so nothing builds
+/// there). The next build starts cold instead of failing halfway with a full disk.
+pub async fn make_room(exec: &dyn Exec, scope: &StepScope, target: &Path, min_free_gb: u64) {
+    let Some(parent) = target.parent() else {
+        return;
+    };
+    let free = |out: Result<CmdOutput, ActivityError>| {
+        out.ok()
+            .filter(CmdOutput::success)
+            .and_then(|o| o.stdout.lines().nth(1)?.trim().parse::<u64>().ok())
+    };
+    let df = || {
+        Cmd::new("df", parent)
+            .args(["--output=avail", "-B1", "--"])
+            .arg(parent.display().to_string())
+            .capture()
+    };
+    let Some(before) = free(run(exec, scope, df()).await) else {
+        return;
+    };
+    let gib = |bytes: u64| bytes >> 30;
+    if gib(before) >= min_free_gb {
+        return;
+    }
+    let debug = target.join("debug");
+    scope
+        .info(format!(
+            "{} GiB free, below {min_free_gb} GiB: removing {} (the next build is cold)",
+            gib(before),
+            debug.display()
+        ))
+        .await;
+    let removed = run(
+        exec,
+        scope,
+        Cmd::new("rm", parent)
+            .args(["-rf", "--"])
+            .arg(debug.display().to_string()),
+    )
+    .await;
+    if let (Ok(out), Some(after)) = (&removed, free(run(exec, scope, df()).await))
+        && out.success()
+    {
+        scope.info(format!("{} GiB free", gib(after))).await;
     }
 }
 
@@ -324,13 +450,17 @@ mod tests {
         let journal = Arc::new(MemoryJournal::default());
         let slot = Arc::new(BuildSlot::default());
         let first = slot
-            .acquire(&scope(&journal), "release checks".into())
+            .acquire(&scope(&journal), "release checks".into(), Builder::Release)
             .await;
         assert!(first.is_ok());
         let waiter = {
             let slot = Arc::clone(&slot);
             let scope = scope(&journal);
-            tokio::spawn(async move { slot.acquire(&scope, "PR #1 clippy".into()).await.map(drop) })
+            tokio::spawn(async move {
+                slot.acquire(&scope, "PR #1 clippy".into(), Builder::PrCi)
+                    .await
+                    .map(drop)
+            })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!waiter.is_finished());
@@ -349,12 +479,122 @@ mod tests {
     async fn waiting_for_the_build_slot_can_be_cancelled() {
         let journal = Arc::new(MemoryJournal::default());
         let slot = BuildSlot::default();
-        let _held = slot.acquire(&scope(&journal), "x".into()).await.unwrap();
+        let _held = slot
+            .acquire(&scope(&journal), "x".into(), Builder::PrCi)
+            .await
+            .unwrap();
         let waiting = scope(&journal);
         waiting.cancel.cancel();
         assert!(matches!(
-            slot.acquire(&waiting, "y".into()).await,
+            slot.acquire(&waiting, "y".into(), Builder::Release).await,
             Err(ActivityError::Cancelled)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_waiting_release_build_goes_before_pr_ci() {
+        let journal = Arc::new(MemoryJournal::default());
+        let slot = Arc::new(BuildSlot::default());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let held = slot
+            .acquire(&scope(&journal), "PR #1 test".into(), Builder::PrCi)
+            .await
+            .unwrap();
+        let wait = |what: &'static str, builder: Builder| {
+            let (slot, order, scope) = (Arc::clone(&slot), Arc::clone(&order), scope(&journal));
+            tokio::spawn(async move {
+                let _guard = slot.acquire(&scope, what.into(), builder).await.unwrap();
+                order.lock().push(what);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            })
+        };
+        // PR CI asked first, the release later; the release builds first.
+        let ci = wait("PR #2 clippy", Builder::PrCi);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let release = wait("release-plz release", Builder::Release);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(held);
+        release.await.unwrap();
+        ci.await.unwrap();
+        assert_eq!(*order.lock(), ["release-plz release", "PR #2 clippy"]);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_release_does_not_hold_back_pr_ci() {
+        let journal = Arc::new(MemoryJournal::default());
+        let slot = Arc::new(BuildSlot::default());
+        let held = slot
+            .acquire(&scope(&journal), "x".into(), Builder::PrCi)
+            .await
+            .unwrap();
+        let release_scope = scope(&journal);
+        let release = {
+            let (slot, scope) = (Arc::clone(&slot), release_scope.clone());
+            tokio::spawn(async move {
+                slot.acquire(&scope, "release".into(), Builder::Release)
+                    .await
+                    .map(drop)
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        release_scope.cancel.cancel();
+        assert!(matches!(
+            release.await.unwrap(),
+            Err(ActivityError::Cancelled)
+        ));
+        drop(held);
+        let ci = tokio::time::timeout(
+            Duration::from_secs(1),
+            slot.acquire(&scope(&journal), "PR".into(), Builder::PrCi),
+        )
+        .await;
+        assert!(matches!(ci, Ok(Ok(_))));
+    }
+
+    /// `df` reports `avail` bytes; `rm` is recorded.
+    struct Disk {
+        free: Mutex<Vec<u64>>,
+        removed: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Exec for Disk {
+        async fn run(&self, _: &StepScope, cmd: Cmd) -> Result<CmdOutput, ExecError> {
+            let stdout = if cmd.program == "df" {
+                format!("Avail\n{}\n", self.free.lock().remove(0))
+            } else {
+                self.removed.lock().push(cmd.args.join(" "));
+                String::new()
+            };
+            Ok(CmdOutput {
+                code: Some(0),
+                stdout,
+                ..CmdOutput::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_build_short_of_disk_removes_its_own_debug_artifacts() {
+        let journal = Arc::new(MemoryJournal::default());
+        let gib = |n: u64| n << 30;
+        let disk = Disk {
+            free: Mutex::new(vec![gib(200), gib(50), gib(150)]),
+            removed: Mutex::new(Vec::new()),
+        };
+        let target = Path::new("/w/target");
+        // Enough room: nothing removed.
+        make_room(&disk, &scope(&journal), target, 80).await;
+        assert!(disk.removed.lock().is_empty());
+        // 50 GiB left: target/debug goes.
+        make_room(&disk, &scope(&journal), target, 80).await;
+        assert_eq!(*disk.removed.lock(), ["-rf -- /w/target/debug"]);
+        let lines = journal.lines.lock();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.line.starts_with("50 GiB free, below 80 GiB"))
+        );
+        assert!(lines.iter().any(|l| l.line == "150 GiB free"));
     }
 }

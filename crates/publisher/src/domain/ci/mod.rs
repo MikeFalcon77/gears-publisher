@@ -15,7 +15,7 @@ pub mod jobs;
 
 use crate::config::PublisherConfig;
 use crate::domain::ports::{Cmd, CmdOutput, Exec, Journal, StepScope};
-use crate::domain::steps::{self, BuildSlot, git_auth, git_env};
+use crate::domain::steps::{self, BuildSlot, Builder, git_auth, git_env};
 use changes::{Changes, Rules};
 use jobs::{JOBS, Job};
 use secrecy::SecretString;
@@ -626,8 +626,19 @@ async fn run_job(
     let _clone = deps.lock_clone(&scope).await?;
     let _slot = deps
         .slot
-        .acquire(&scope, format!("PR #{} {}", state.pr_number, job.name))
+        .acquire(
+            &scope,
+            format!("PR #{} {}", state.pr_number, job.name),
+            Builder::PrCi,
+        )
         .await?;
+    steps::make_room(
+        deps.exec.as_ref(),
+        &scope,
+        &deps.config.ci_target_dir(),
+        deps.config.min_free_disk_gb,
+    )
+    .await;
     scope
         .info(format!("job: {} ({})", job.name, job.workflow))
         .await;
@@ -701,6 +712,8 @@ fn check_command(
             config.ci_target_dir().display().to_string(),
         )
         .env("CARGO_NET_GIT_FETCH_WITH_CLI", "true")
+        // As gears-rust's ci.yml: incremental artifacts only fill the disk.
+        .env("CARGO_INCREMENTAL", "0")
         .env("CI", "true");
     let rewrites: Vec<(String, String)> = config
         .ci_git_rewrites

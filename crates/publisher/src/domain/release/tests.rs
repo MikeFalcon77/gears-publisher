@@ -487,6 +487,11 @@ async fn checks_fetch_git_dependencies_with_the_token() {
                 .iter()
                 .any(|(k, v)| k == "CARGO_NET_GIT_FETCH_WITH_CLI" && v == "true")
         );
+        assert!(
+            cmd.env
+                .iter()
+                .any(|(k, v)| k == "CARGO_INCREMENTAL" && v == "0")
+        );
         ok("")
     });
     let exec = exec.reversed();
