@@ -524,9 +524,16 @@ async fn prepare(deps: Arc<Deps>, scope: StepScope, input: ReleaseInput) -> Step
 }
 
 /// The configured check commands (gears-rust's CI). A failure stops the run until Retry.
+/// Checks that passed on the same commit earlier in this run are not run again.
 async fn checks(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState) -> StepResult {
     follow_main(&deps, &scope, &mut state).await?;
     deps.ensure_tree(&scope, &state, Tree::Main).await?;
+    let sha = state
+        .main_sha
+        .clone()
+        .ok_or_else(|| ActivityError::permanent("commit_unknown"))?;
+    let passed_file = deps.run_dir(&scope)?.join("checks.passed");
+    let mut passed = passed_checks(&passed_file, &sha);
     // Checks fetch git dependencies from GitHub too (`make dylint` builds its lints
     // from cargo-gears), and GitHub refuses anonymous reads of the organization's
     // repositories. cargo's built-in libgit2 ignores `http.extraheader`, so cargo
@@ -535,10 +542,17 @@ async fn checks(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState) -> S
     let token = deps.gh_token(&scope).await?;
     let _slot = deps.build_slot(&scope, "release checks").await?;
     for check in &deps.config.checks {
+        let key = check_key(check);
         let mut words = check.split_whitespace();
         let Some(program) = words.next() else {
             continue;
         };
+        if passed.contains(&key) {
+            scope
+                .info(format!("check: {check}: already passed on {sha}"))
+                .await;
+            continue;
+        }
         let program = if program == "make" {
             deps.config.make_bin.as_str()
         } else {
@@ -567,8 +581,36 @@ async fn checks(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState) -> S
                 .await;
             return Err(ActivityError::permanent("checks_failed"));
         }
+        record_passed_check(&passed_file, &sha, &key)?;
+        passed.insert(key);
     }
     Ok(state)
+}
+
+/// A check command with its whitespace normalized, as it is run.
+fn check_key(check: &str) -> String {
+    check.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Checks recorded in `file` as passed on `sha` (lines `<sha> <check>`).
+fn passed_checks(file: &Path, sha: &str) -> BTreeSet<String> {
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(at, _)| *at == sha)
+        .map(|(_, check)| check.to_owned())
+        .collect()
+}
+
+fn record_passed_check(file: &Path, sha: &str, key: &str) -> Result<(), ActivityError> {
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)
+        .and_then(|mut f| writeln!(f, "{sha} {key}"))
+        .map_err(|_| ActivityError::retryable("fs_failed"))
 }
 
 /// Moves the run to the current `origin/main`. Until the release PR is opened nothing

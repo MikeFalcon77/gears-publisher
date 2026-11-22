@@ -477,6 +477,60 @@ async fn checks_follow_main_when_it_moves_before_the_release_pr() {
     assert!(h.exec.calls_matching("checkout --force -B work fix789") >= 1);
 }
 
+/// The first `make test-no-macros` is killed (a restart); the second passes.
+fn interrupted_tests(exec: FakeExec) -> FakeExec {
+    exec.on("make test-no-macros", |_, n| {
+        if n == 1 {
+            CmdOutput {
+                code: None,
+                ..ok("")
+            }
+        } else {
+            ok("")
+        }
+    })
+}
+
+#[tokio::test]
+async fn checks_passed_on_the_same_commit_are_not_run_again() {
+    let exec = interrupted_tests(release_exec()).reversed();
+    let h = harness(exec, published(), &fast());
+    let run = TestRuntime::new()
+        .run(&h.workflow, ReleaseInput { dry_run: true })
+        .await
+        .unwrap();
+    assert_eq!(run.attempts("checks"), 2);
+    assert_eq!(h.exec.calls_matching("make fmt"), 1);
+    assert_eq!(h.exec.calls_matching("make clippy"), 1);
+    assert_eq!(h.exec.calls_matching("make dylint"), 1);
+    assert_eq!(h.exec.calls_matching("make test-no-macros"), 2);
+    assert_eq!(h.exec.calls_matching("make test-macros"), 1);
+    assert!(
+        h.journal
+            .lines
+            .lock()
+            .iter()
+            .any(|l| l.attempt == 2 && l.line.contains("make clippy: already passed on abc123"))
+    );
+}
+
+#[tokio::test]
+async fn checks_run_again_when_main_moves() {
+    let exec = interrupted_tests(release_exec())
+        .on("rev-parse origin/main", |_, n| {
+            ok(if n == 1 { "abc123\n" } else { "fix789\n" })
+        })
+        .reversed();
+    let h = harness(exec, published(), &fast());
+    let run = TestRuntime::new()
+        .run(&h.workflow, ReleaseInput { dry_run: true })
+        .await
+        .unwrap();
+    assert_eq!(run.attempts("checks"), 2);
+    assert_eq!(h.exec.calls_matching("make clippy"), 2);
+    assert_eq!(h.exec.calls_matching("make test-no-macros"), 2);
+}
+
 #[tokio::test]
 async fn checks_fetch_git_dependencies_with_the_token() {
     // `make dylint` builds its lints from a git dependency on GitHub.
