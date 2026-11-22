@@ -364,6 +364,8 @@ async fn a_dry_run_ends_at_the_first_unpublished_dependency() {
         })
         .on("diff --stat", |_, _| ok(" libs/a/Cargo.toml | 2 +-\n"))
         .on("release-plz release -o json --dry-run", |cmd, _| {
+            // The tree carries `release-plz update`'s uncommitted changes.
+            assert!(cmd.args.iter().any(|a| a == "--allow-dirty"));
             // release-plz needs a forge even in a dry run (it looks up the release PR).
             assert!(cmd.secrets.iter().any(|(k, _)| k == "GIT_TOKEN"));
             assert!(!cmd.secrets.iter().any(|(k, _)| k == "CARGO_REGISTRY_TOKEN"));

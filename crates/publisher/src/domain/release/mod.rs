@@ -925,10 +925,13 @@ async fn release_attempt(
         .capture()
         .watch(&[SEEN_DRY_SKIP, SEEN_UNPUBLISHED_DEP, SEEN_429]);
     if dry_run {
-        // Without a git token release-plz configures no forge, and `release` fails
-        // before it publishes anything: it always looks up the commit's release PR.
+        // `--allow-dirty`: the tree carries `release-plz update`'s uncommitted bump,
+        // which `cargo publish` refuses otherwise. A real release publishes a clean
+        // merge commit. Without a git token release-plz configures no forge, and
+        // `release` fails before it publishes anything: it always looks up the
+        // commit's release PR.
         cmd = cmd
-            .arg("--dry-run")
+            .args(["--dry-run", "--allow-dirty"])
             .secret("GIT_TOKEN", deps.gh_token(scope).await?);
     } else {
         let Some(registry_token) = deps.registry_token() else {

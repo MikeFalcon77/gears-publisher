@@ -25,7 +25,7 @@ then does the `release` job again on the merge commit.
 | `release_pr` | `release-plz release-pr -o json` → PR and packages. Dry run: `release-plz update` + `git diff --stat` | retry ×3 |
 | `wait_merge` | polls `gh pr view` every minute: MERGED → merge commit, CLOSED → fails | up to 14 days |
 | `sync_main` | checkout the merge commit, `release_retry.py snapshot` (only the first snapshot counts) | retry ×3 |
-| `publish` | the `release` job on the merge commit: `release-plz release -o json` (`--dry-run` in a dry run) | 429s: until done; other errors: 6 attempts |
+| `publish` | the `release` job on the merge commit: `release-plz release -o json` (`--dry-run --allow-dirty` in a dry run: the tree carries `update`'s uncommitted bump) | 429s: until done; other errors: 6 attempts |
 | `heal_tags` | `release_retry.py collect`: tags published crates that have no tag; full list of releases | retry ×3 |
 | `verify` | every releasable workspace package: version on the crates.io sparse index, tag exists | retries for ~10 min (index lag), then fails |
 
