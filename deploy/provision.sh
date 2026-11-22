@@ -127,7 +127,9 @@ chown -R publisher-build:publisher-build "$WORK"
 install -d -o publisher -g publisher-build -m 2775 "$WORK/runs"
 id publisher-ci >/dev/null 2>&1 \
   || useradd --system --create-home --home-dir "$CI_HOME" --shell /usr/sbin/nologin publisher-ci
-chmod 0750 "$CI_HOME"
+# 0751: the service starts PR CI commands in $CI_HOME/work, so it must traverse the
+# home; it still cannot list it.
+chmod 0751 "$CI_HOME"
 install -d -o publisher-ci -g publisher-ci -m 0755 "$CI_HOME/work"
 install -d -o publisher -g publisher -m 0755 "$MIRROR"
 install -d -o root -g publisher -m 0750 "$ETC"
