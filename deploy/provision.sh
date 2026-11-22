@@ -206,6 +206,12 @@ git_for_builds() {
 }
 git_for_builds publisher-build "$BUILD_HOME"
 git_for_builds publisher-ci "$CI_HOME"
+# PR CI clones from the service's mirror (PUBLISHER_CI_MIRROR), which publisher owns:
+# without this git refuses it as "dubious ownership".
+ci_mirror="$MIRROR/gears-rust.git"
+sudo -u publisher-ci HOME="$CI_HOME" git config --global --get-all safe.directory \
+  | grep -qxF "$ci_mirror" \
+  || sudo -u publisher-ci HOME="$CI_HOME" git config --global --add safe.directory "$ci_mirror"
 
 log "PostgreSQL"
 systemctl enable --now postgresql
