@@ -237,7 +237,7 @@ limits leave room for that (failed checks and repeated publish errors stop the r
 - Commands start from an empty environment: a short allowlist (`PATH`, `HOME`, …), the
   configured `env` and the command's own variables. `CARGO_REGISTRY_TOKEN` and the gh token
   are passed only to the commands that need them (`release-plz release`, `release-pr`,
-  `release_retry.py wait/collect`), never as arguments, and are masked in the log.
+  `update` and `release --dry-run` in a dry run (the changelog template and the release-PR lookup read GitHub), `release_retry.py wait/collect`), never as arguments, and are masked in the log.
 - PR CI runs a pull request's code as `publisher-ci`, which is not in `publisher-build`'s
   group: it cannot write the release's clone, target directory or run files (a planted
   `.git/config` there would run with the gh token at the next release). The PR is fetched into

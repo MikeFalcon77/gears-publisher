@@ -357,9 +357,16 @@ async fn a_dry_run_ends_at_the_first_unpublished_dependency() {
             assert!(!cmd.args.iter().any(|a| a.contains("gho_test_token")));
             ok("")
         })
-        .on("release-plz update", |_, _| ok(""))
+        // The changelog template reads GitHub: update gets the token, as release-pr does.
+        .on("release-plz update", |cmd, _| {
+            assert!(cmd.secrets.iter().any(|(k, _)| k == "GIT_TOKEN"));
+            ok("")
+        })
         .on("diff --stat", |_, _| ok(" libs/a/Cargo.toml | 2 +-\n"))
-        .on("release-plz release -o json --dry-run", |_, _| {
+        .on("release-plz release -o json --dry-run", |cmd, _| {
+            // release-plz needs a forge even in a dry run (it looks up the release PR).
+            assert!(cmd.secrets.iter().any(|(k, _)| k == "GIT_TOKEN"));
+            assert!(!cmd.secrets.iter().any(|(k, _)| k == "CARGO_REGISTRY_TOKEN"));
             fail(&[
                 "cf-a 0.2.0: due to dry, skipping the following: [\"cargo registry upload\"]",
                 "failed to select a version for the requirement `cf-a = \"^0.2.0\"`",

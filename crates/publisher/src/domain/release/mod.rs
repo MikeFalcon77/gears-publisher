@@ -417,10 +417,15 @@ impl Deps {
         let _ = std::fs::remove_file(&marker);
         self.checkout(scope, rev).await?;
         if update {
+            // The changelog template reads GitHub (`remote.contributors`, PR numbers),
+            // like `release-pr`, which gets the same token.
+            let token = self.gh_token(scope).await?;
             self.run_ok(
                 scope,
                 self.cargo_env(
-                    Cmd::new(&self.config.release_plz_bin, self.clone_dir()).arg("update"),
+                    Cmd::new(&self.config.release_plz_bin, self.clone_dir())
+                        .arg("update")
+                        .secret("GIT_TOKEN", token),
                 ),
                 ActivityError::permanent,
                 "release_plz_update_failed",
@@ -920,7 +925,11 @@ async fn release_attempt(
         .capture()
         .watch(&[SEEN_DRY_SKIP, SEEN_UNPUBLISHED_DEP, SEEN_429]);
     if dry_run {
-        cmd = cmd.arg("--dry-run");
+        // Without a git token release-plz configures no forge, and `release` fails
+        // before it publishes anything: it always looks up the commit's release PR.
+        cmd = cmd
+            .arg("--dry-run")
+            .secret("GIT_TOKEN", deps.gh_token(scope).await?);
     } else {
         let Some(registry_token) = deps.registry_token() else {
             scope
