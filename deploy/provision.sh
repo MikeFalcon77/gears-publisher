@@ -236,6 +236,10 @@ log "host hardening"
 install -m 0644 "$APP/src/deploy/sshd-hardening.conf" /etc/ssh/sshd_config.d/00-gears-publisher.conf
 sshd -t && systemctl reload ssh
 systemctl disable --now rpcbind.socket rpcbind.service 2>/dev/null || true
+# Names that do not exist must not resolve (see the file).
+install -D -m 0644 "$APP/src/deploy/resolved-no-search-domain.conf" \
+  /etc/systemd/resolved.conf.d/no-search-domain.conf
+systemctl restart systemd-resolved
 
 log "systemd unit"
 install -m 0644 "$APP/src/deploy/gears-publisher.service" /etc/systemd/system/gears-publisher.service
