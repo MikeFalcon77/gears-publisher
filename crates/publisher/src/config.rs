@@ -27,6 +27,7 @@ pub struct PublisherConfig {
     pub secrets_file: Option<String>,
     /// Python with `pyyaml`, used for `release_retry.py`.
     #[serde(default = "defaults::python")]
+    #[expand_vars]
     pub python: String,
     #[serde(default = "defaults::release_plz")]
     pub release_plz_bin: String,
@@ -252,6 +253,20 @@ mod tests {
             config("", "").ci_clone_dir(),
             PathBuf::from("/w/pr-ci/gears-rust")
         );
+    }
+
+    /// deploy's publisher.yaml sets `python: "${PUBLISHER_PYTHON:-python3}"`.
+    #[test]
+    fn python_is_expanded() {
+        use toolkit::var_expand::ExpandVars as _;
+        let mut config: PublisherConfig = serde_json::from_value(serde_json::json!({
+            "work_dir": "/w", "target_dir": "/t", "queue_dsn": "postgres://x",
+            "firebase_project_id": "p",
+            "python": "${PUBLISHER_TEST_UNSET_PYTHON:-python3}",
+        }))
+        .unwrap();
+        config.expand_vars().unwrap();
+        assert_eq!(config.python, "python3");
     }
 }
 
