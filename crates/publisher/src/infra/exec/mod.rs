@@ -60,14 +60,19 @@ pub struct RunAs {
 }
 
 enum Chunk {
-    Out(String),
+    /// `raw`: the bytes as read, for the captured stdout; `text`: the line for the log
+    /// (split at [`MAX_LINE_BYTES`], ANSI and `\r` progress stripped).
+    Out {
+        raw: Vec<u8>,
+        text: String,
+    },
     Err(String),
 }
 
 async fn pump<R: AsyncRead + Unpin>(
     reader: R,
     tx: mpsc::Sender<Chunk>,
-    wrap: fn(String) -> Chunk,
+    wrap: fn(&[u8], String) -> Chunk,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::new();
@@ -85,7 +90,8 @@ async fn pump<R: AsyncRead + Unpin>(
         // Progress output rewrites one line with `\r`; keep its last state.
         let text = text.trim_end_matches(['\n', '\r']);
         let text = text.rsplit('\r').next().unwrap_or_default();
-        if tx.send(wrap(strip_ansi(text))).await.is_err() {
+        let line = strip_ansi(text);
+        if tx.send(wrap(&buf, line)).await.is_err() {
             return Ok(());
         }
     }
@@ -198,27 +204,19 @@ impl Exec for ProcessExec {
         let pid = child.id();
         feed(&mut child, secrets);
 
-        let (tx, mut rx) = mpsc::channel::<Chunk>(1024);
-        let stdout = child.stdout.take().map(|out| {
-            let tx = tx.clone();
-            tokio::spawn(pump(out, tx, Chunk::Out))
-        });
-        let stderr = child.stderr.take().map(|err| {
-            let tx = tx.clone();
-            tokio::spawn(pump(err, tx, Chunk::Err))
-        });
-        drop(tx);
+        let (mut rx, stdout, stderr) = pumps(&mut child);
 
         let mut output = CmdOutput::default();
+        // Exactly what the command wrote: `cargo metadata` is one JSON line of megabytes.
+        let mut captured = Vec::new();
         let mut tail = VecDeque::with_capacity(TAIL_LINES);
         let mut logger = OutputLog::start(scope, &cmd, &masker).await;
         let consume = async {
             while let Some(chunk) = rx.recv().await {
                 let (stream, text) = match chunk {
-                    Chunk::Out(text) => {
-                        if cmd.capture && output.stdout.len() < MAX_CAPTURE_BYTES {
-                            output.stdout.push_str(&text);
-                            output.stdout.push('\n');
+                    Chunk::Out { raw, text } => {
+                        if cmd.capture && captured.len() < MAX_CAPTURE_BYTES {
+                            captured.extend_from_slice(&raw);
                         }
                         if cmd.logged == Logged::Stderr {
                             continue;
@@ -287,6 +285,7 @@ impl Exec for ProcessExec {
             source,
         })?;
         output.code = status.code();
+        output.stdout = String::from_utf8_lossy(&captured).into_owned();
         output.tail = tail.into_iter().collect();
         let exit = output
             .code
@@ -336,6 +335,22 @@ fn feed(child: &mut tokio::process::Child, secrets: Option<String>) {
 const STUCK: &str = "output still open after exit; stopped reading";
 
 /// Stops reading the pipes.
+/// Readers of the child's stdout and stderr, feeding one channel.
+fn pumps(child: &mut tokio::process::Child) -> (mpsc::Receiver<Chunk>, Option<Pump>, Option<Pump>) {
+    let (tx, rx) = mpsc::channel::<Chunk>(1024);
+    let stdout = child.stdout.take().map(|out| {
+        tokio::spawn(pump(out, tx.clone(), |raw, text| Chunk::Out {
+            raw: raw.to_vec(),
+            text,
+        }))
+    });
+    let stderr = child
+        .stderr
+        .take()
+        .map(|err| tokio::spawn(pump(err, tx, |_, text| Chunk::Err(text))));
+    (rx, stdout, stderr)
+}
+
 fn stop(stdout: Option<Pump>, stderr: Option<Pump>) {
     for task in [stdout, stderr].into_iter().flatten() {
         task.abort();
@@ -754,6 +769,32 @@ mod tests {
             .unwrap();
         assert_eq!(out.stdout, "hidden\n");
         assert!(!journal.lines.lock().iter().any(|l| l.line == "hidden"));
+    }
+
+    /// The log splits long lines; the captured stdout stays byte for byte (verify
+    /// parses `cargo metadata`, one JSON line of over a megabyte).
+    #[tokio::test]
+    async fn a_long_line_is_captured_whole() {
+        let exec = ProcessExec {
+            base_env: HashMap::new(),
+            run_as: None,
+        };
+        // 200 000 × "é" (2 bytes): chunk borders fall inside characters too.
+        let script = format!(
+            "printf '{{\"s\":\"'; i=0; while [ $i -lt 2000 ]; do printf '{}'; \
+             i=$((i+1)); done; printf '\"}}\\n'",
+            "é".repeat(100)
+        );
+        let out = exec
+            .run(
+                &scope(Arc::new(MemoryJournal::default())),
+                Cmd::new("sh", ".").args(["-c", &script]).quiet(),
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(value["s"].as_str().unwrap().chars().count(), 200_000);
+        assert!(value["s"].as_str().unwrap().chars().all(|c| c == 'é'));
     }
 
     #[tokio::test]
