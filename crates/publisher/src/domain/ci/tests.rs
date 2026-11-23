@@ -52,7 +52,19 @@ struct Harness {
     _dir: tempfile::TempDir,
     work: PathBuf,
     exec: Arc<FakeExec>,
+    journal: Arc<MemoryJournal>,
     workflow: Workflow<CiInput, CiState>,
+}
+
+impl Harness {
+    fn journal_lines(&self) -> Vec<String> {
+        self.journal
+            .lines
+            .lock()
+            .iter()
+            .map(|l| l.line.clone())
+            .collect()
+    }
 }
 
 fn harness(exec: FakeExec, ci_token: bool) -> Harness {
@@ -78,10 +90,11 @@ fn harness(exec: FakeExec, ci_token: bool) -> Harness {
     }))
     .unwrap();
     let exec = Arc::new(exec);
+    let journal = Arc::new(MemoryJournal::default());
     let deps = Arc::new(CiDeps {
         config,
         exec: Arc::clone(&exec) as Arc<dyn Exec>,
-        journal: Arc::new(MemoryJournal::default()),
+        journal: Arc::clone(&journal) as Arc<dyn Journal>,
         slot: Arc::new(BuildSlot::default()),
         clone: Mutex::new(()),
     });
@@ -90,6 +103,7 @@ fn harness(exec: FakeExec, ci_token: bool) -> Harness {
         _dir: dir,
         work,
         exec,
+        journal,
     }
 }
 
@@ -129,6 +143,35 @@ async fn a_failed_job_does_not_stop_the_others() {
     assert_eq!(h.exec.calls_matching("make dylint"), 1);
     // Clippy's own later steps... it has none after `cargo clippy`; its earlier ones ran.
     assert_eq!(h.exec.calls_matching("check-test-container-pins"), 1);
+}
+
+/// PR #5724: the disk filled while the tests linked. The job says so, names the
+/// test, and the run tells to re-run rather than to fix the PR.
+#[tokio::test]
+async fn a_full_disk_is_named_as_the_hosts_fault() {
+    let exec = exec("gears/x/src/lib.rs\n")
+        .on("make test-no-macros", |_, _| {
+            fail(&[
+                "    warning: unexpected `cfg` condition value: `grpc-client`",
+                "              collect2: fatal error: ld terminated with signal 7 [Bus error]",
+                "        FAIL [ 715.813s] (27693/27693) cf-gears-toolkit-contract-macros-tests::ui ui",
+            ])
+        })
+        .reversed();
+    let h = harness(exec, true);
+    let run = TestRuntime::new().run(&h.workflow, input()).await.unwrap();
+    assert!(matches!(run.outcome(), TestOutcome::Failed { .. }));
+    let lines = h.journal_lines();
+    assert!(
+        lines.iter().any(|l| l.contains("ran out of disk space")
+            && l.contains("cf-gears-toolkit-contract-macros-tests::ui ui")),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("not the PR: Re-run failed jobs"))
+    );
 }
 
 #[tokio::test]

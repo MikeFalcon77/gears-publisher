@@ -299,8 +299,10 @@ mod defaults {
     pub fn cargo() -> String {
         "cargo".into()
     }
+    /// A full rebuild of the test suite writes about 112 GiB; less room than that runs out
+    /// in the middle of linking (`ld` dies with a bus error).
     pub fn min_free_disk_gb() -> u64 {
-        80
+        130
     }
     pub fn checks() -> Vec<String> {
         [

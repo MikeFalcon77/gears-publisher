@@ -121,6 +121,10 @@ export interface JobResult {
   conclusion: JobConclusion;
   failed_step?: string | null;
   reason?: string | null;
+  /** Why it failed when the host broke it (disk, memory), not the code. */
+  host_problem?: string | null;
+  /** Failing tests and crates that did not compile. */
+  failures?: string[];
 }
 
 /** PR CI's state (ci/mod.rs `CiState`); the first facts hold only `pr_number`/`only`. */

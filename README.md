@@ -133,8 +133,8 @@ PR CI and the release share the host: one heavy build runs at a time (release `c
 `release-pr`, `release-plz release`, each CI job); the others wait and say so in their log.
 A waiting release build goes before PR CI, so a release between `release-plz release`
 attempts does not wait behind a PR's tests. Builds run with `CARGO_INCREMENTAL=0`, as in
-gears-rust's CI. Each build checks the disk first: below `min_free_disk_gb` (default 80 GiB)
-free it removes its own `target/debug` and starts cold.
+gears-rust's CI. Each build checks the disk first: below `min_free_disk_gb` (default 130 GiB; a full
+test rebuild writes about 112) free it removes its own `target/debug` and starts cold.
 
 Not run: Docker lanes (database integration, e2e), macOS/Windows, FIPS, coverage, CodeQL, CFS.
 Results are not posted to GitHub.

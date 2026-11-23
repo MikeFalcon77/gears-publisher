@@ -14,6 +14,7 @@ pub mod changes;
 pub mod jobs;
 
 use crate::config::PublisherConfig;
+use crate::domain::diagnose::{HOST_PATTERNS, diagnose};
 use crate::domain::ports::{Cmd, CmdOutput, Exec, Journal, StepScope};
 use crate::domain::steps::{self, BuildSlot, Builder, git_auth, git_env};
 use changes::{Changes, Rules};
@@ -89,6 +90,12 @@ pub struct JobResult {
     /// Why the job was skipped.
     #[serde(default)]
     pub reason: Option<String>,
+    /// Why a failed job failed when the host, not the code, broke it (disk, memory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_problem: Option<String>,
+    /// Failing tests and crates that did not compile, from the failed command's output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<String>,
 }
 
 /// Everything the run has learnt so far. Also stored as the run's facts.
@@ -616,6 +623,8 @@ async fn run_job(
             conclusion: Conclusion::Skipped,
             failed_step: None,
             reason: Some(reason),
+            host_problem: None,
+            failures: Vec::new(),
         });
         return Ok(state);
     }
@@ -668,15 +677,7 @@ async fn run_job(
             let Some(cmd) = cmd else { continue };
             let out = deps.run(&scope, cmd).await?;
             if !out.success() {
-                scope
-                    .info(format!("{}: `{}` failed", job.name, job_step.name))
-                    .await;
-                state.record(JobResult {
-                    id: job.id.into(),
-                    conclusion: Conclusion::Failure,
-                    failed_step: Some(job_step.name.into()),
-                    reason: None,
-                });
+                state.record(failed_job(&deps, &scope, job, job_step.name, &out).await);
                 return Ok(state);
             }
         }
@@ -686,8 +687,43 @@ async fn run_job(
         conclusion: Conclusion::Success,
         failed_step: None,
         reason: None,
+        host_problem: None,
+        failures: Vec::new(),
     });
     Ok(state)
+}
+
+/// A job whose step failed, with what its output says about why.
+async fn failed_job(
+    deps: &CiDeps,
+    scope: &StepScope,
+    job: &Job,
+    step: &str,
+    out: &CmdOutput,
+) -> JobResult {
+    let target = deps.config.ci_target_dir();
+    let free = steps::free_gib(
+        deps.exec.as_ref(),
+        scope,
+        target.parent().unwrap_or(Path::new("/")),
+    )
+    .await;
+    let diagnosis = diagnose(out, free);
+    let why = diagnosis
+        .summary()
+        .map(|s| format!(": {s}"))
+        .unwrap_or_default();
+    scope
+        .info(format!("{}: `{step}` failed{why}", job.name))
+        .await;
+    JobResult {
+        id: job.id.into(),
+        conclusion: Conclusion::Failure,
+        failed_step: Some(step.into()),
+        reason: None,
+        host_problem: diagnosis.cause.map(|c| c.explain().to_owned()),
+        failures: diagnosis.failures,
+    }
 }
 
 /// A `run:` line as a command in the CI clone (split on whitespace; `make` and
@@ -714,7 +750,8 @@ fn check_command(
         .env("CARGO_NET_GIT_FETCH_WITH_CLI", "true")
         // As gears-rust's ci.yml: incremental artifacts only fill the disk.
         .env("CARGO_INCREMENTAL", "0")
-        .env("CI", "true");
+        .env("CI", "true")
+        .watch(&HOST_PATTERNS);
     let rewrites: Vec<(String, String)> = config
         .ci_git_rewrites
         .iter()
@@ -738,12 +775,22 @@ async fn conclusion(_: Arc<CiDeps>, scope: StepScope, state: CiState) -> StepRes
             Some(JobResult {
                 conclusion: Conclusion::Failure,
                 failed_step,
+                host_problem,
+                failures,
                 ..
-            }) => format!(
-                "✗ {}: {}",
-                job.name,
-                failed_step.as_deref().unwrap_or("failed")
-            ),
+            }) => [
+                Some(format!(
+                    "✗ {}: {}",
+                    job.name,
+                    failed_step.as_deref().unwrap_or("failed")
+                )),
+                host_problem.clone(),
+                (!failures.is_empty()).then(|| format!("failed: {}", failures.join("; "))),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" — "),
             Some(JobResult { reason, .. }) => format!(
                 "– {}: skipped{}",
                 job.name,
@@ -764,9 +811,14 @@ async fn conclusion(_: Arc<CiDeps>, scope: StepScope, state: CiState) -> StepRes
         .iter()
         .filter_map(|j| jobs::job(&j.id).map(|job| job.name))
         .collect();
+    let next = if failed.iter().all(|j| j.host_problem.is_some()) {
+        "The build host broke them, not the PR: Re-run failed jobs"
+    } else {
+        "Fix them in the PR, then Re-run"
+    };
     scope
         .info(format!(
-            "{} failed: {}. Fix them in the PR, then Re-run",
+            "{} failed: {}. {next}",
             if names.len() == 1 { "1 job" } else { "jobs" },
             names.join(", ")
         ))

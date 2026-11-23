@@ -10,6 +10,10 @@ export interface JobView extends StepView {
   failedStep?: string;
   /** Why it was skipped. */
   reason?: string;
+  /** The host, not the code, broke it. */
+  hostProblem?: string;
+  /** Failing tests and crates that did not compile. */
+  failures?: string[];
 }
 
 const OWN_STEPS: Record<string, string> = {
@@ -34,6 +38,8 @@ export function jobViews(ci: CiInfo, run: CiSummary & { history?: CiRun['history
     if (result?.conclusion === 'failure') {
       row.status = 'failed';
       row.failedStep = result.failed_step ?? undefined;
+      row.hostProblem = result.host_problem ?? undefined;
+      row.failures = result.failures?.length ? result.failures : undefined;
       row.error = undefined;
     } else if (result?.conclusion === 'skipped') {
       row.status = 'skipped';
@@ -45,6 +51,12 @@ export function jobViews(ci: CiInfo, run: CiSummary & { history?: CiRun['history
 
 export function failedJobs(facts: CiFacts | undefined): JobResult[] {
   return (facts?.jobs ?? []).filter((j) => j.conclusion === 'failure');
+}
+
+/** `Failed: a; b. ` for the failing tests the jobs named, or nothing. */
+function failedNames(failed: JobResult[]): string {
+  const names = failed.flatMap((j) => j.failures ?? []);
+  return names.length ? `Failed: ${names.join('; ')}. ` : '';
 }
 
 export interface JobCounts {
@@ -100,11 +112,19 @@ export function ciGuidance(ci: CiInfo, run: CiRun, views: JobView[]): CiGuidance
     case 'failed':
     case 'compensation_failed': {
       const failed = failedJobs(facts);
+      if (state.error === 'checks_failed' && failed.length && failed.every((j) => j.host_problem))
+        return {
+          kind: 'admin',
+          title: `The build host broke ${failed.length === 1 ? 'a job' : `${failed.length} jobs`}, not the PR: ${failed.map((j) => name(j.id)).join(', ')}`,
+          detail: `${failed[0].host_problem}.`,
+          button: 'rerun_failed',
+        };
       if (state.error === 'checks_failed' && failed.length)
         return {
           kind: 'action',
           title: `${failed.length === 1 ? 'A job' : `${failed.length} jobs`} failed: ${failed.map((j) => name(j.id)).join(', ')}`,
           detail:
+            failedNames(failed) +
             'See Problems. Push a fix to the PR, then Re-run failed jobs: it tests the PR’s current head. ' +
             'For a flaky test, re-run with no new commits.',
           button: 'rerun_failed',

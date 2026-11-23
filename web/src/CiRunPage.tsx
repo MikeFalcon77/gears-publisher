@@ -223,6 +223,14 @@ function JobRow({ view, now, selected, onSelect }: { view: JobView; now: number;
           </div>
           {view.workflow && <div className="font-mono text-[11px] text-slate-400">{view.workflow}</div>}
           {view.failedStep && <div className="mt-0.5 text-xs text-rose-700">failed at: {view.failedStep}</div>}
+          {view.hostProblem && <div className="mt-0.5 text-xs text-amber-800">{view.hostProblem}</div>}
+          {view.failures && (
+            <ul className="mt-0.5 space-y-0.5 font-mono text-[11px] break-all text-rose-700">
+              {view.failures.map((f) => (
+                <li key={f}>✗ {f}</li>
+              ))}
+            </ul>
+          )}
           {view.reason && <div className="mt-0.5 text-xs text-slate-500">{view.reason}</div>}
           {view.error && <div className="mt-0.5 font-mono text-xs text-rose-700">{view.error}</div>}
           {view.retryAt && <div className="mt-0.5 text-xs text-amber-700">next attempt {formatTime(view.retryAt)}</div>}

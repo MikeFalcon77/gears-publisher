@@ -370,6 +370,23 @@ impl BuildSlot {
     }
 }
 
+/// Free space, in GiB, on the filesystem that holds `path`.
+pub async fn free_gib(exec: &dyn Exec, scope: &StepScope, path: &Path) -> Option<u64> {
+    let out = run(
+        exec,
+        scope,
+        Cmd::new("df", path)
+            .args(["--output=avail", "-B1", "--"])
+            .arg(path.display().to_string())
+            .capture(),
+    )
+    .await
+    .ok()
+    .filter(CmdOutput::success)?;
+    let bytes = out.stdout.lines().nth(1)?.trim().parse::<u64>().ok()?;
+    Some(bytes >> 30)
+}
+
 /// Before a heavy build: when the filesystem of `target` has less than `min_free_gb`
 /// left, removes the build's own `target/debug` (the slot is held, so nothing builds
 /// there). The next build starts cold instead of failing halfway with a full disk.
@@ -377,29 +394,16 @@ pub async fn make_room(exec: &dyn Exec, scope: &StepScope, target: &Path, min_fr
     let Some(parent) = target.parent() else {
         return;
     };
-    let free = |out: Result<CmdOutput, ActivityError>| {
-        out.ok()
-            .filter(CmdOutput::success)
-            .and_then(|o| o.stdout.lines().nth(1)?.trim().parse::<u64>().ok())
-    };
-    let df = || {
-        Cmd::new("df", parent)
-            .args(["--output=avail", "-B1", "--"])
-            .arg(parent.display().to_string())
-            .capture()
-    };
-    let Some(before) = free(run(exec, scope, df()).await) else {
+    let Some(before) = free_gib(exec, scope, parent).await else {
         return;
     };
-    let gib = |bytes: u64| bytes >> 30;
-    if gib(before) >= min_free_gb {
+    if before >= min_free_gb {
         return;
     }
     let debug = target.join("debug");
     scope
         .info(format!(
-            "{} GiB free, below {min_free_gb} GiB: removing {} (the next build is cold)",
-            gib(before),
+            "{before} GiB free, below {min_free_gb} GiB: removing {} (the next build is cold)",
             debug.display()
         ))
         .await;
@@ -411,10 +415,10 @@ pub async fn make_room(exec: &dyn Exec, scope: &StepScope, target: &Path, min_fr
             .arg(debug.display().to_string()),
     )
     .await;
-    if let (Ok(out), Some(after)) = (&removed, free(run(exec, scope, df()).await))
+    if let (Ok(out), Some(after)) = (&removed, free_gib(exec, scope, parent).await)
         && out.success()
     {
-        scope.info(format!("{} GiB free", gib(after))).await;
+        scope.info(format!("{after} GiB free")).await;
     }
 }
 

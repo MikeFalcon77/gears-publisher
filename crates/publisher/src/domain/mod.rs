@@ -2,6 +2,7 @@
 //! release and PR CI workflows, the use cases behind the API, and the ports they need.
 pub mod access;
 pub mod ci;
+pub mod diagnose;
 pub mod error;
 pub mod identity;
 pub mod models;

@@ -89,6 +89,39 @@ describe('ciGuidance', () => {
     expect(g).toMatchObject({ kind: 'action', title: 'A job failed: Clippy', button: 'rerun_failed' });
   });
 
+  it('blames the host, not the PR, when the disk ran out', () => {
+    const facts: CiFacts = {
+      pr_number: 42,
+      jobs: [
+        {
+          id: 'test',
+          conclusion: 'failure',
+          failed_step: 'cargo test',
+          host_problem: 'the build host ran out of disk space (not the code’s fault); re-run it',
+          failures: ['cf-a::ui ui'],
+        },
+      ],
+    };
+    const r = run({ kind: 'failed', error: 'checks_failed', completed_at: done }, facts);
+    const views = jobViews(CI, r);
+    expect(ciGuidance(CI, r, views)).toMatchObject({ kind: 'admin', button: 'rerun_failed' });
+    expect(ciGuidance(CI, r, views).title).toMatch(/build host broke a job, not the PR/);
+    const test = views.find((v) => v.id === 'test');
+    expect(test?.hostProblem).toMatch(/disk space/);
+    expect(test?.failures).toEqual(['cf-a::ui ui']);
+  });
+
+  it('names the failing tests of a code failure', () => {
+    const facts: CiFacts = {
+      pr_number: 42,
+      jobs: [{ id: 'test', conclusion: 'failure', failed_step: 'cargo test', failures: ['cf-a::it one', 'cf-b two'] }],
+    };
+    const r = run({ kind: 'failed', error: 'checks_failed', completed_at: done }, facts);
+    const g = ciGuidance(CI, r, jobViews(CI, r));
+    expect(g.kind).toBe('action');
+    expect(g.detail).toMatch(/^Failed: cf-a::it one; cf-b two\. /);
+  });
+
   it('asks to resolve conflicts, then Retry', () => {
     const r = run({ kind: 'failed', error: 'merge_conflict', completed_at: done }, { pr_number: 42 });
     expect(ciGuidance(CI, r, jobViews(CI, r))).toMatchObject({ kind: 'action', button: 'retry' });

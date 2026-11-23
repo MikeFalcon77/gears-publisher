@@ -16,6 +16,7 @@
 pub mod crates_io;
 
 use crate::config::{PublisherConfig, Timings};
+use crate::domain::diagnose::{HOST_PATTERNS, HostCause, diagnose};
 use crate::domain::ports::{Cmd, CmdOutput, Exec, Journal, Registry, StepScope};
 use crate::domain::steps::{
     self, BuildGuard, BuildSlot, Builder, cancellable_sleep, git_auth, last_json,
@@ -577,13 +578,29 @@ async fn checks(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState) -> S
         if condensed {
             cmd = cmd.condensed();
         }
-        let out = deps.run(&scope, cmd).await?;
+        let out = deps.run(&scope, cmd.watch(&HOST_PATTERNS)).await?;
         if !out.success() {
-            scope
-                .info(format!(
-                    "`{check}` failed; fix main, then press Retry: it checks the latest main"
-                ))
-                .await;
+            let free = steps::free_gib(
+                deps.exec.as_ref(),
+                &scope,
+                Path::new(&deps.config.target_dir)
+                    .parent()
+                    .unwrap_or(Path::new("/")),
+            )
+            .await;
+            let diagnosis = diagnose(&out, free);
+            let next = match diagnosis.cause {
+                Some(HostCause::DiskFull) => {
+                    "not main's fault: press Retry, the step frees disk space first"
+                }
+                Some(HostCause::OutOfMemory) => "not main's fault: press Retry",
+                None => "fix main, then press Retry: it checks the latest main",
+            };
+            let why = diagnosis
+                .summary()
+                .map(|s| format!(": {s}"))
+                .unwrap_or_default();
+            scope.info(format!("`{check}` failed{why}; {next}")).await;
             return Err(ActivityError::permanent("checks_failed"));
         }
         record_passed_check(&passed_file, &sha, &key)?;
