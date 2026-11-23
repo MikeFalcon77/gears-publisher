@@ -1,11 +1,11 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { GitPullRequest, Play } from 'lucide-react';
+import { GitPullRequest, ListOrdered, Play, X } from 'lucide-react';
 import { api } from './api';
 import { navigate } from './router';
-import { jobCounts, parsePr, prNumber } from './ciview';
+import { jobCounts, parsePr, prNumber, queuePlace } from './ciview';
 import { formatDuration, formatTime, isActive, statusLabel, tone } from './runview';
-import type { CiInfo, CiSummary } from './types';
+import type { CiInfo, CiSummary, QueuedCi, Started } from './types';
 import { Badge, Button, ErrorNote } from './ui';
 
 export function CiPage({ ci }: { ci: CiInfo }) {
@@ -15,17 +15,42 @@ export function CiPage({ ci }: { ci: CiInfo }) {
     queryFn: () => api<CiSummary[]>('/runs?kind=ci'),
     refetchInterval: 5000,
   });
+  const queue = useQuery({
+    queryKey: ['ci-queue'],
+    queryFn: () => api<QueuedCi[]>('/ci/queue'),
+    refetchInterval: 5000,
+  });
   const [text, setText] = useState('');
+  const [queued, setQueued] = useState<{ pr: number; position: number }>();
   const pr = parsePr(text);
+  const refresh = () => {
+    void client.invalidateQueries({ queryKey: ['runs', 'ci'] });
+    void client.invalidateQueries({ queryKey: ['ci-queue'] });
+  };
   const start = useMutation({
-    mutationFn: (number: number) => api<{ id: string }>('/ci', 'POST', { pr: number }),
-    onSuccess: ({ id }) => {
-      void client.invalidateQueries({ queryKey: ['runs', 'ci'] });
-      navigate(`/runs/${id}`);
+    mutationFn: (number: number) => api<Started>('/ci', 'POST', { pr: number }),
+    onSuccess: (started, number) => {
+      refresh();
+      if (started.queued) {
+        setQueued({ pr: number, position: started.position ?? 1 });
+        setText('');
+      } else {
+        navigate(`/runs/${started.id}`);
+      }
     },
   });
+  const cancelQueued = useMutation({
+    mutationFn: (id: string) => api<{ ok: boolean }>(`/ci/queue/${id}/cancel`, 'POST'),
+    onSuccess: refresh,
+  });
+  // Only runs and entries this person may see; someone else's run may still be in
+  // progress, and the server then queues the request.
   const active = runs.data?.find((r) => isActive(r.progress));
-  const supersedes = active && pr !== undefined && prNumber(active.record?.facts) === pr;
+  const waiting = queue.data ?? [];
+  const supersedes =
+    pr !== undefined &&
+    ((active !== undefined && prNumber(active.record?.facts) === pr) || waiting.some((q) => q.pr === pr));
+  const queues = !supersedes && (active !== undefined || waiting.length > 0);
 
   return (
     <div className="space-y-4">
@@ -65,23 +90,73 @@ export function CiPage({ ci }: { ci: CiInfo }) {
           <Button
             type="submit"
             variant="primary"
-            disabled={pr === undefined || start.isPending || Boolean(ci.unavailable) || (Boolean(active) && !supersedes)}
+            disabled={pr === undefined || start.isPending || Boolean(ci.unavailable)}
             title={
               ci.unavailable ??
-              (active && !supersedes
-                ? `CI of PR #${prNumber(active.record?.facts)} is in progress`
-                : supersedes
-                  ? 'Cancels the run in progress for this PR, like a new push on GitHub'
-                  : undefined)
+              (supersedes
+                ? 'Replaces the run or request for this PR, like a new push on GitHub'
+                : queues
+                  ? 'Waits for the CI in progress, then starts by itself'
+                  : 'Starts now, or waits for the CI in progress, then starts by itself')
             }
           >
-            <Play className="h-4 w-4" /> {supersedes ? 'Run again' : 'Run CI'}
+            <Play className="h-4 w-4" /> {supersedes ? 'Run again' : queues ? 'Queue CI' : 'Run CI'}
           </Button>
         </form>
       </section>
       {ci.unavailable && <ErrorNote error={`PR CI is disabled on this host: ${ci.unavailable}`} />}
+      {queued && !start.error && (
+        <p role="status" className="rounded-md bg-sky-50 px-3 py-2 text-sm text-sky-900 ring-1 ring-sky-200">
+          PR #{queued.pr} is queued: {queuePlace(queued.position).toLowerCase()}. It starts by itself; this page updates.
+        </p>
+      )}
       <ErrorNote error={start.error} />
+      <ErrorNote error={cancelQueued.error} />
       <ErrorNote error={runs.error} />
+      <ErrorNote error={queue.error} />
+
+      {waiting.length > 0 && (
+        <section className="overflow-x-auto rounded-xl bg-white shadow-sm ring-1 ring-slate-200">
+          <h2 className="flex items-center gap-2 px-4 pt-3 text-sm font-semibold">
+            <ListOrdered className="h-4 w-4 text-slate-400" /> Queued
+          </h2>
+          <table className="w-full text-left text-sm">
+            <thead className="text-xs tracking-wide text-slate-500 uppercase">
+              <tr>
+                <th className="px-4 py-2 font-medium">Pull request</th>
+                <th className="px-4 py-2 font-medium">Place</th>
+                <th className="px-4 py-2 font-medium">Queued</th>
+                <th className="px-4 py-2 font-medium">By</th>
+                <th className="px-4 py-2" />
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {waiting.map((entry) => (
+                <tr key={entry.id}>
+                  <td className="px-4 py-2.5">
+                    <span className="font-medium">#{entry.pr}</span>
+                    {entry.jobs?.length ? (
+                      <span className="font-mono text-xs text-slate-400"> · re-run: {entry.jobs.join(', ')}</span>
+                    ) : null}
+                  </td>
+                  <td className="px-4 py-2.5 text-slate-600">{queuePlace(entry.position)}</td>
+                  <td className="px-4 py-2.5 whitespace-nowrap text-slate-600">{formatTime(entry.queued_at)}</td>
+                  <td className="px-4 py-2.5 text-slate-600">{entry.requested_by}</td>
+                  <td className="px-4 py-2.5 text-right">
+                    <Button
+                      onClick={() => cancelQueued.mutate(entry.id)}
+                      disabled={cancelQueued.isPending}
+                      title="Take it out of the queue"
+                    >
+                      <X className="h-4 w-4" /> Cancel
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
 
       <section className="overflow-x-auto rounded-xl bg-white shadow-sm ring-1 ring-slate-200">
         <table className="w-full text-left text-sm">

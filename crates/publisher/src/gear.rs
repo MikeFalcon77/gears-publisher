@@ -3,6 +3,7 @@ use crate::api::rest::{self as rest, AppState};
 use crate::config::PublisherConfig;
 use crate::domain::access::{Directory, ServiceAuthorizer, service_context};
 use crate::domain::ci::{self, CiDeps};
+use crate::domain::models::LiveEvent;
 use crate::domain::ports::{Exec, Journal};
 use crate::domain::release::{self, Deps};
 use crate::domain::repos::{RunRepository, UserRepository};
@@ -21,6 +22,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::{DatabaseCapability, Gear, GearCtx, RestApiCapability};
@@ -203,6 +205,7 @@ impl PublisherGear {
             "engine is serving"
         );
         tokio::spawn(prune_logs(Arc::clone(service), cancel.clone()));
+        tokio::spawn(dispatch_ci(Arc::clone(service), cancel.clone()));
         Ok(runner.run(cancel).await?)
     }
 
@@ -225,6 +228,34 @@ async fn prune_logs(service: Arc<RunService>, cancel: CancellationToken) {
         tokio::select! {
             () = tokio::time::sleep(Duration::from_hours(24)) => {}
             () = cancel.cancelled() => return,
+        }
+    }
+}
+
+/// Starts queued PR CI once the run in progress settles. A run that fails or is
+/// cancelled does not always say so on the live channel, hence the tick.
+async fn dispatch_ci(service: Arc<RunService>, cancel: CancellationToken) {
+    const TICK: Duration = Duration::from_secs(5);
+    let mut live = service.subscribe();
+    loop {
+        match service.dispatch_ci().await {
+            Ok(Some(run_id)) => tracing::info!(%run_id, "queued PR CI started"),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "failed to start queued PR CI"),
+        }
+        let wait = tokio::time::sleep(TICK);
+        tokio::pin!(wait);
+        // Log lines do not change a run's state; wait for a change notice or the tick.
+        loop {
+            tokio::select! {
+                () = &mut wait => break,
+                () = cancel.cancelled() => return,
+                received = live.recv() => match received {
+                    Ok(LiveEvent::Changed(_)) | Err(RecvError::Lagged(_)) => break,
+                    Ok(LiveEvent::Log(_)) => {}
+                    Err(RecvError::Closed) => return,
+                },
+            }
         }
     }
 }

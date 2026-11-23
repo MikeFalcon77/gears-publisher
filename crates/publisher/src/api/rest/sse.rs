@@ -46,9 +46,9 @@ pub async fn stream_run(
     Path(id): Path<Uuid>,
     Query(q): Query<StreamQuery>,
 ) -> Result<Response, ApiError> {
-    app.access.person(&ctx).await?;
-    // Fails with 404 before the stream starts.
-    let first = app.service.progress(id).await?;
+    let person = app.access.person(&ctx).await?;
+    // Fails with 404 before the stream starts, also for a run the caller may not see.
+    let first = app.service.progress_for(&person, id).await?;
     let (tx, rx) = mpsc::channel::<Event>(256);
     tokio::spawn(pump(app, id, q.after, first, tx));
     let stream = futures_util::StreamExt::map(ReceiverStream::new(rx), Ok::<_, Infallible>);
@@ -94,7 +94,7 @@ async fn pump(
 
     let backlog = async |after: &mut i64| -> Result<(), ()> {
         loop {
-            let lines = service.log(id, *after, PAGE).await.map_err(|_| ())?;
+            let lines = service.lines(id, *after, PAGE).await.map_err(|_| ())?;
             let n = lines.len();
             for line in lines {
                 *after = line.seq;

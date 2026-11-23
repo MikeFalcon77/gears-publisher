@@ -92,7 +92,7 @@ every verified Firebase user, Google or GitHub. The gear decides what each may d
 | Who | How they get there | May |
 |---|---|---|
 | admin | `publisher.admins` in publisher.yaml | everything, and approve access requests on `/admin` |
-| member | an admin approved their request | start, rerun and cancel PR CI; follow releases read-only |
+| member | an admin approved their request | start, rerun and cancel their own PR CI (they do not see others'); follow releases read-only |
 | pending | signed in and asked, with a note ("name, why") | edit the note and wait |
 | rejected | an admin rejected or revoked them | nothing |
 | anyone else | signed in | ask for access |
@@ -127,7 +127,9 @@ skipped when its `if:` filters (`rust`, `deps`, `ci`) say so. A failed job does 
 others. **Re-run failed jobs** and **Re-run all jobs** start a new run on the PR's current head
 (re-run jobs ignore the filters); **Retry** continues a run that stopped before the jobs (e.g.
 after resolving a merge conflict). As with GitHub's `concurrency` group, a new run of the same
-PR cancels the one in progress; another PR's run has to finish first.
+PR replaces your run in progress or in the queue (an admin's replaces anyone's). Another PR's
+CI waits in a queue (`publisher_ci_queue`, shown on the CI page) and starts by itself once the
+run in progress settles; a queued request can be cancelled before it starts.
 
 PR CI and the release share the host: one heavy build runs at a time (release `checks`,
 `release-pr`, `release-plz release`, each CI job); the others wait and say so in their log.
@@ -248,6 +250,8 @@ limits leave room for that (failed checks and repeated publish errors stop the r
   project; anything else answers 401. A valid token alone gets only `/me` and the access request:
   every run route answers 403 (`not_registered`, `pending_approval`, `rejected`) unless the caller
   is an admin or an approved member, and release controls answer 403 `admin_only` to members.
+  A member's PR CI runs and queue entries are theirs alone: anyone else's answer 404, as if
+  they did not exist (runs record the starter's subject id in `publisher_runs.started_by_subject`).
   Checked on the live host: no token, a garbage token, `alg: none`, RS256 signed with a foreign key
   under Google's real `kid`, and HS256 are all refused. So are `//`, `..`, `%2F` and other path variants.
 - Caddy proxies only `/`, `/index.html`, `/favicon.svg`, `/ci`, `/admin`, `/runs/*`, `/assets/*` and `/publisher/v1/*`.

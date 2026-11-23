@@ -2,12 +2,13 @@
 use super::AppState;
 use super::dto::{
     AcceptedDto, AccessListDto, AccessRequestReq, CiInfoDto, ListQuery, LogLineDto, LogQuery,
-    MeDto, RunDetailDto, RunSummaryDto, StartCiReq, StartReleaseReq, StartedDto, UserDto, decision,
+    MeDto, QueuedCiDto, RunDetailDto, RunSummaryDto, StartCiReq, StartReleaseReq, StartedDto,
+    UserDto, decision,
 };
 use super::error::{ApiError, ApiResult};
 use crate::domain::error::DomainError;
 use crate::domain::release::{ReleaseInput, STEPS};
-use crate::domain::service::Standing;
+use crate::domain::service::{CiStart, Standing};
 use axum::{
     Extension, Json,
     extract::{Path, Query},
@@ -51,8 +52,8 @@ pub async fn list_runs(
     Extension(ctx): Ctx,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Vec<RunSummaryDto>> {
-    app.access.person(&ctx).await?;
-    let runs = app.service.list(q.kind.map(Into::into)).await?;
+    let person = app.access.person(&ctx).await?;
+    let runs = app.service.list(&person, q.kind.map(Into::into)).await?;
     Ok(Json(runs.into_iter().map(Into::into).collect()))
 }
 
@@ -72,17 +73,45 @@ pub async fn start_release(
             },
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(StartedDto { id })))
+    Ok((StatusCode::CREATED, Json(StartedDto::run(id))))
 }
 
+/// `201` with the run, or `202` with the queue entry when another PR's CI is running.
 pub async fn start_ci(
     Extension(app): App,
     Extension(ctx): Ctx,
     Json(body): Json<StartCiReq>,
 ) -> Result<(StatusCode, Json<StartedDto>), ApiError> {
     let person = app.access.person(&ctx).await?;
-    let id = app.service.start_ci(&person, body.pr, body.jobs).await?;
-    Ok((StatusCode::CREATED, Json(StartedDto { id })))
+    Ok(
+        match app.service.start_ci(&person, body.pr, body.jobs).await? {
+            CiStart::Started(id) => (StatusCode::CREATED, Json(StartedDto::run(id))),
+            CiStart::Queued { id, position } => (
+                StatusCode::ACCEPTED,
+                Json(StartedDto {
+                    id,
+                    queued: true,
+                    position: Some(position),
+                }),
+            ),
+        },
+    )
+}
+
+pub async fn ci_queue(Extension(app): App, Extension(ctx): Ctx) -> ApiResult<Vec<QueuedCiDto>> {
+    let person = app.access.person(&ctx).await?;
+    let queue = app.service.ci_queue(&person).await?;
+    Ok(Json(queue.into_iter().map(Into::into).collect()))
+}
+
+pub async fn cancel_queued(
+    Extension(app): App,
+    Extension(ctx): Ctx,
+    Path(id): Path<Uuid>,
+) -> ApiResult<AcceptedDto> {
+    let person = app.access.person(&ctx).await?;
+    app.service.cancel_queued(&person, id).await?;
+    Ok(Json(AcceptedDto { ok: true }))
 }
 
 pub async fn get_run(
@@ -90,8 +119,8 @@ pub async fn get_run(
     Extension(ctx): Ctx,
     Path(id): Path<Uuid>,
 ) -> ApiResult<RunDetailDto> {
-    app.access.person(&ctx).await?;
-    Ok(Json(app.service.get(id).await?.into()))
+    let person = app.access.person(&ctx).await?;
+    Ok(Json(app.service.get(&person, id).await?.into()))
 }
 
 pub async fn run_log(
@@ -100,10 +129,10 @@ pub async fn run_log(
     Path(id): Path<Uuid>,
     Query(q): Query<LogQuery>,
 ) -> ApiResult<Vec<LogLineDto>> {
-    app.access.person(&ctx).await?;
+    let person = app.access.person(&ctx).await?;
     let lines = app
         .service
-        .log(id, q.after, q.limit.unwrap_or(2000))
+        .log(&person, id, q.after, q.limit.unwrap_or(2000))
         .await?;
     Ok(Json(lines.into_iter().map(Into::into).collect()))
 }

@@ -38,6 +38,18 @@ pub fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     );
     endpoint!(
         get,
+        "/publisher/v1/ci/queue",
+        "publisher.ci_queue",
+        handlers::ci_queue
+    );
+    endpoint!(
+        post,
+        "/publisher/v1/ci/queue/{id}/cancel",
+        "publisher.cancel_queued",
+        handlers::cancel_queued
+    );
+    endpoint!(
+        get,
         "/publisher/v1/runs/{id}",
         "publisher.get_run",
         handlers::get_run

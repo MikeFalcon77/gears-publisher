@@ -6,9 +6,10 @@
 //! else is a member only once an admin approved their request, and may otherwise do
 //! nothing but ask. Durable runs, however,
 //! are visible only to the subject that started them, and a release is a team effort:
-//! anyone on the list must see and retry anyone's run. So the gear starts and controls
-//! every run as one service identity, and records the human who pressed the button
-//! in its own `publisher_runs` table.
+//! every member follows every release, and any admin continues any run. So the gear
+//! starts and controls every run as one service identity, and records the human who
+//! pressed the button in its own `publisher_runs` table; [`Person::may_see`] and
+//! [`Person::may_control`] decide from that record (a member's PR CI is theirs alone).
 use crate::config::PublisherConfig;
 use crate::domain::models::{Person, Role};
 use async_trait::async_trait;
@@ -79,13 +80,15 @@ impl Directory {
             .admins
             .iter()
             .map(|user| {
+                let subject_id = subject_id(
+                    &config.subject_namespace,
+                    &config.firebase_project_id,
+                    &user.uid,
+                );
                 (
-                    subject_id(
-                        &config.subject_namespace,
-                        &config.firebase_project_id,
-                        &user.uid,
-                    ),
+                    subject_id,
                     Person {
+                        subject_id,
                         uid: user.uid.clone(),
                         email: Some(user.email.clone()),
                         name: None,

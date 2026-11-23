@@ -170,6 +170,26 @@ export interface CiInfo {
   unavailable: string | null;
 }
 
+/** `POST /ci`: a started run, or a queue entry when another PR's CI is running. */
+export interface Started {
+  /** The run; the queue entry when `queued`. */
+  id: string;
+  queued: boolean;
+  /** Place in the queue, 1: next. */
+  position?: number;
+}
+
+/** A PR CI waiting for the run in progress. A member sees only their own. */
+export interface QueuedCi {
+  id: string;
+  /** Place among everyone's entries, 1: next. */
+  position: number;
+  pr: number;
+  jobs: string[] | null;
+  requested_by: string;
+  queued_at: string;
+}
+
 export interface LogLine {
   seq: number;
   run_id: string;

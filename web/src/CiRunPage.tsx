@@ -5,7 +5,7 @@ import { api } from './api';
 import { navigate } from './router';
 import { ciGuidance, failedJobs, jobViews, prNumber, type CiGuidance, type JobView } from './ciview';
 import { actions, formatDuration, formatTime, statusLabel, tone } from './runview';
-import type { CiFacts, CiInfo, CiRun } from './types';
+import type { CiFacts, CiInfo, CiRun, Started } from './types';
 import { Badge, Button, Details, ErrorNote, StepIcon } from './ui';
 import { LogViewer } from './LogViewer';
 import type { Log } from './uselog';
@@ -53,10 +53,12 @@ export function CiRunView({
   const canRetry = allowed.retry && failedStep !== undefined && failedStep.id !== 'conclusion';
 
   const rerun = useMutation({
-    mutationFn: (jobs?: string[]) => api<{ id: string }>('/ci', 'POST', { pr: number, jobs }),
-    onSuccess: ({ id: started }) => {
+    mutationFn: (jobs?: string[]) => api<Started>('/ci', 'POST', { pr: number, jobs }),
+    onSuccess: (started) => {
       void client.invalidateQueries({ queryKey: ['runs', 'ci'] });
-      navigate(`/runs/${started}`);
+      void client.invalidateQueries({ queryKey: ['ci-queue'] });
+      // Queued behind another PR's run: the CI page shows the queue.
+      navigate(started.queued ? '/ci' : `/runs/${started.id}`);
     },
   });
   const busyAny = busy || rerun.isPending;

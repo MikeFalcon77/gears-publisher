@@ -9,6 +9,8 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub run_id: Uuid,
     pub started_by: String,
+    /// `None` for runs recorded before owners were, unless a member's label matched.
+    pub started_by_subject: Option<Uuid>,
     pub dry_run: bool,
     pub created_at: DateTimeUtc,
     pub facts: Json,

@@ -1,8 +1,8 @@
 //! Run metadata and the run log in PostgreSQL, with a live fan-out.
-use crate::domain::models::{LiveEvent, LogLine, NewLine, RunRecord};
+use crate::domain::models::{LiveEvent, LogLine, NewLine, QueuedCi, RunRecord};
 use crate::domain::ports::Journal;
 use crate::domain::repos::RunRepository;
-use crate::infra::db::entity::{log, runs};
+use crate::infra::db::entity::{ci_queue, log, runs};
 use async_trait::async_trait;
 use chrono::Utc;
 use sea_orm::{Set, entity::prelude::*, sea_query::Expr};
@@ -40,10 +40,26 @@ impl From<runs::Model> for RunRecord {
         Self {
             run_id: m.run_id,
             started_by: m.started_by,
+            started_by_subject: m.started_by_subject,
             dry_run: m.dry_run,
             created_at: m.created_at,
             facts: m.facts,
         }
+    }
+}
+
+impl TryFrom<ci_queue::Model> for QueuedCi {
+    type Error = anyhow::Error;
+
+    fn try_from(m: ci_queue::Model) -> anyhow::Result<Self> {
+        Ok(Self {
+            id: m.id,
+            pr: u64::try_from(m.pr)?,
+            jobs: m.jobs.map(serde_json::from_value).transpose()?,
+            requested_by: m.requested_by,
+            requested_by_subject: m.requested_by_subject,
+            queued_at: m.queued_at,
+        })
     }
 }
 
@@ -98,6 +114,7 @@ impl RunRepository for PgRunRepository {
         &self,
         run_id: Uuid,
         started_by: &str,
+        started_by_subject: Uuid,
         dry_run: bool,
         facts: serde_json::Value,
     ) -> anyhow::Result<()> {
@@ -106,6 +123,7 @@ impl RunRepository for PgRunRepository {
             runs::ActiveModel {
                 run_id: Set(run_id),
                 started_by: Set(started_by.to_owned()),
+                started_by_subject: Set(Some(started_by_subject)),
                 dry_run: Set(dry_run),
                 created_at: Set(Utc::now()),
                 facts: Set(facts),
@@ -172,6 +190,60 @@ impl RunRepository for PgRunRepository {
             .exec(&conn)
             .await?;
         Ok(result.rows_affected)
+    }
+
+    async fn enqueue_ci(&self, entry: QueuedCi) -> anyhow::Result<()> {
+        let conn = self.db.conn()?;
+        secure_insert::<ci_queue::Entity>(
+            ci_queue::ActiveModel {
+                id: Set(entry.id),
+                pr: Set(i64::try_from(entry.pr)?),
+                jobs: Set(entry.jobs.map(|ids| serde_json::json!(ids))),
+                requested_by: Set(entry.requested_by),
+                requested_by_subject: Set(entry.requested_by_subject),
+                queued_at: Set(entry.queued_at),
+            },
+            &scope(),
+            &conn,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn ci_queue(&self) -> anyhow::Result<Vec<QueuedCi>> {
+        let conn = self.db.conn()?;
+        ci_queue::Entity::find()
+            .secure()
+            .scope_with(&scope())
+            .order_by(ci_queue::Column::QueuedAt, sea_orm::Order::Asc)
+            .all(&conn)
+            .await?
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect()
+    }
+
+    async fn take_ci(&self, id: Uuid) -> anyhow::Result<Option<QueuedCi>> {
+        let conn = self.db.conn()?;
+        let Some(entry) = ci_queue::Entity::find_by_id(id)
+            .secure()
+            .scope_with(&scope())
+            .one(&conn)
+            .await?
+        else {
+            return Ok(None);
+        };
+        // Whoever deletes the row owns the entry: of two racing takers, one gets `None`.
+        let deleted = ci_queue::Entity::delete_many()
+            .secure()
+            .scope_with(&scope())
+            .filter(sea_orm::Condition::all().add(ci_queue::Column::Id.eq(id)))
+            .exec(&conn)
+            .await?;
+        if deleted.rows_affected == 0 {
+            return Ok(None);
+        }
+        entry.try_into().map(Some)
     }
 }
 

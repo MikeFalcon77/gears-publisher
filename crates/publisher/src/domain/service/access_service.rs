@@ -47,6 +47,7 @@ impl AccessService {
             None => Standing::Unknown(claims(ctx)),
             Some(user) => match user.status {
                 AccessStatus::Approved => Standing::Member(Person {
+                    subject_id: user.subject_id,
                     uid: user.uid,
                     email: user.email,
                     name: user.name,
@@ -265,8 +266,20 @@ mod tests {
 
         let member = access.person(&stranger).await.unwrap();
         assert_eq!(member.role, Role::Member);
-        assert!(member.may_control(RunKind::Ci));
-        assert!(!member.may_control(RunKind::Release));
+        assert_eq!(member.subject_id, stranger.subject_id());
+        assert!(member.may_start(RunKind::Ci));
+        assert!(!member.may_start(RunKind::Release));
+        let own = Some(member.subject_id);
+        let foreign = Some(Uuid::from_u128(9));
+        assert!(member.may_control(RunKind::Ci, own));
+        assert!(!member.may_control(RunKind::Ci, foreign));
+        assert!(!member.may_control(RunKind::Ci, None));
+        assert!(!member.may_control(RunKind::Release, own));
+        assert!(member.may_see(RunKind::Ci, own));
+        assert!(!member.may_see(RunKind::Ci, foreign));
+        assert!(!member.may_see(RunKind::Ci, None));
+        assert!(member.may_see(RunKind::Release, foreign));
+        assert!(member.may_see(RunKind::Release, None));
         assert!(matches!(
             access.admin(&stranger).await,
             Err(DomainError::AdminOnly)
@@ -298,7 +311,13 @@ mod tests {
         let access = service();
         let ctx = admin_ctx(&access);
         let admin = access.admin(&ctx).await.unwrap();
-        assert!(admin.may_control(RunKind::Release));
+        assert_eq!(admin.subject_id, ctx.subject_id());
+        for kind in RunKind::ALL {
+            assert!(admin.may_start(kind));
+            assert!(admin.may_control(kind, Some(Uuid::from_u128(9))));
+            assert!(admin.may_control(kind, None));
+            assert!(admin.may_see(kind, None));
+        }
         assert_eq!(admin.name.as_deref(), Some("Name root"));
         assert!(matches!(
             access.request(&ctx, "me").await,

@@ -4,10 +4,10 @@
 use async_trait::async_trait;
 use publisher::domain::access::{ServiceAuthorizer, service_context};
 use publisher::domain::error::DomainError;
-use publisher::domain::models::{AccessStatus, Person, Role};
+use publisher::domain::models::{AccessStatus, Person, QueuedCi, Role};
 use publisher::domain::ports::{Cmd, CmdOutput, Exec, ExecError, Registry, StepScope};
 use publisher::domain::release::{self as workflow, Deps, ReleaseInput};
-use publisher::domain::repos::{NewRequest, UserRepository};
+use publisher::domain::repos::{NewRequest, RunRepository, UserRepository};
 use publisher::domain::service::RunService as Service;
 use publisher::domain::steps::BuildSlot;
 use publisher::infra::db::{
@@ -169,12 +169,22 @@ async fn wait_for(
     }
 }
 
-/// A member may not start a release, nor control one.
+/// A member sees a release but may not start or control one.
 async fn a_member_cannot_touch_it(service: &Service, admin: &Person, id: uuid::Uuid) {
     let member = Person {
+        subject_id: uuid::Uuid::new_v4(),
         role: Role::Member,
         ..admin.clone()
     };
+    assert!(service.get(&member, id).await.is_ok());
+    assert!(
+        service
+            .list(&member, None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.progress.id.0 == id)
+    );
     assert!(matches!(
         service
             .start_release(&member, ReleaseInput::default())
@@ -199,6 +209,7 @@ async fn a_run_continues_after_a_restart_in_the_middle_of_a_step() {
     std::fs::create_dir_all(work.path().join("gears-rust/.git")).unwrap();
     let queue = format!("publisher-test-{}", uuid::Uuid::new_v4().simple());
     let person = Person {
+        subject_id: uuid::Uuid::new_v4(),
         uid: "u".into(),
         email: Some("tester@example.com".into()),
         name: None,
@@ -261,7 +272,7 @@ async fn a_run_continues_after_a_restart_in_the_middle_of_a_step() {
         "{:?}",
         done.state
     );
-    let detail = second.service.get(id).await.unwrap();
+    let detail = second.service.get(&person, id).await.unwrap();
     let attempts = |step: &str| {
         detail
             .progress
@@ -272,8 +283,10 @@ async fn a_run_continues_after_a_restart_in_the_middle_of_a_step() {
     };
     assert_eq!(attempts("prepare"), Some(1), "prepare is not repeated");
     assert_eq!(attempts("checks"), Some(2), "checks restarts once");
-    assert_eq!(detail.record.unwrap().started_by, "tester@example.com");
-    let log = second.service.log(id, 0, 5000).await.unwrap();
+    let record = detail.record.unwrap();
+    assert_eq!(record.started_by, "tester@example.com");
+    assert_eq!(record.started_by_subject, Some(person.subject_id));
+    let log = second.service.log(&person, id, 0, 5000).await.unwrap();
     assert!(log.iter().any(|l| l.line == "long build started"));
     assert!(
         log.iter()
@@ -334,4 +347,60 @@ async fn access_requests_round_trip_in_postgres() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PUBLISHER_TEST_PG_URL"]
+async fn run_owners_and_the_ci_queue_round_trip_in_postgres() {
+    let url = std::env::var("PUBLISHER_TEST_PG_URL").expect("PUBLISHER_TEST_PG_URL");
+    let db = toolkit_db::connect_db(&url, toolkit_db::ConnectOpts::default())
+        .await
+        .unwrap();
+    migrate(&db).await;
+    let runs = PgRunRepository::new(toolkit_db::DBProvider::new(db));
+    let owner = uuid::Uuid::new_v4();
+    let run = uuid::Uuid::new_v4();
+    runs.create_run(run, "dev@example.com", owner, false, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        runs.run(run).await.unwrap().unwrap().started_by_subject,
+        Some(owner)
+    );
+
+    let now = chrono::Utc::now();
+    let entry = |pr: u64, seconds: i64, jobs: Option<Vec<String>>| QueuedCi {
+        id: uuid::Uuid::new_v4(),
+        pr,
+        jobs,
+        requested_by: "dev@example.com".into(),
+        requested_by_subject: owner,
+        queued_at: now + chrono::Duration::seconds(seconds),
+    };
+    let later = entry(2, 1, None);
+    let sooner = entry(1, 0, Some(vec!["fmt".into(), "test".into()]));
+    runs.enqueue_ci(later.clone()).await.unwrap();
+    runs.enqueue_ci(sooner.clone()).await.unwrap();
+    let mine: Vec<QueuedCi> = runs
+        .ci_queue()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.id == later.id || e.id == sooner.id)
+        .collect();
+    assert_eq!(
+        mine.iter().map(|e| e.id).collect::<Vec<_>>(),
+        [sooner.id, later.id],
+        "oldest first"
+    );
+    assert_eq!(mine[0].jobs, sooner.jobs);
+    assert_eq!(mine[0].pr, 1);
+    assert_eq!(mine[0].requested_by_subject, owner);
+    let taken = runs.take_ci(sooner.id).await.unwrap().unwrap();
+    assert_eq!(taken.jobs, sooner.jobs);
+    assert!(
+        runs.take_ci(sooner.id).await.unwrap().is_none(),
+        "taken once"
+    );
+    assert!(runs.take_ci(later.id).await.unwrap().is_some());
 }

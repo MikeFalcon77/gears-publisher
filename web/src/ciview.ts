@@ -184,3 +184,10 @@ export function parsePr(text: string): number | undefined {
   const n = match ? Number(match[1]) : NaN;
   return Number.isSafeInteger(n) && n > 0 ? n : undefined;
 }
+
+/** Where a queued PR CI stands, by its place in the queue (1: next). */
+export function queuePlace(position: number): string {
+  if (position <= 1) return 'Next: starts when the run in progress finishes';
+  const ahead = position - 1;
+  return `${ahead} ${ahead === 1 ? 'request' : 'requests'} ahead`;
+}

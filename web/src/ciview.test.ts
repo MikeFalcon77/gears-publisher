@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ciGuidance, jobCounts, jobViews, parsePr } from './ciview';
+import { ciGuidance, jobCounts, jobViews, parsePr, queuePlace } from './ciview';
 import { LogModel } from './logmodel';
 import type { CiFacts, CiInfo, CiRun, LogLine, RunState, StepProgress } from './types';
 
@@ -178,5 +178,13 @@ describe('LogModel on PR CI', () => {
     expect(model.attempts[0].by).toBe('a@example.com');
     expect(model.attempts[0].mainSha).toBe('3e76e00000000000000000000000000000000002');
     expect(model.attempts[0].commitLabel).toBe('merge');
+  });
+});
+
+describe('queuePlace', () => {
+  it('says how many wait ahead', () => {
+    expect(queuePlace(1)).toBe('Next: starts when the run in progress finishes');
+    expect(queuePlace(2)).toBe('1 request ahead');
+    expect(queuePlace(4)).toBe('3 requests ahead');
   });
 });

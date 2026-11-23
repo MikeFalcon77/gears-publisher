@@ -1,7 +1,7 @@
 //! Request and response bodies.
 use crate::domain::ci;
 use crate::domain::models::{
-    AccessStatus, LogLine, Person, RunDetail, RunKind, RunRecord, RunSummary, UserRecord,
+    AccessStatus, LogLine, Person, QueuedCi, RunDetail, RunKind, RunRecord, RunSummary, UserRecord,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -198,9 +198,51 @@ pub struct StartCiReq {
     pub jobs: Option<Vec<String>>,
 }
 
+/// A started run, or for PR CI, a queue entry (`queued`).
 #[derive(Debug, Serialize)]
 pub struct StartedDto {
+    /// The run; the queue entry when `queued`.
     pub id: Uuid,
+    pub queued: bool,
+    /// The entry's place in the queue (1: next).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<usize>,
+}
+
+impl StartedDto {
+    #[must_use]
+    pub fn run(id: Uuid) -> Self {
+        Self {
+            id,
+            queued: false,
+            position: None,
+        }
+    }
+}
+
+/// A PR CI waiting to start.
+#[derive(Debug, Serialize)]
+pub struct QueuedCiDto {
+    pub id: Uuid,
+    /// 1: next.
+    pub position: usize,
+    pub pr: u64,
+    pub jobs: Option<Vec<String>>,
+    pub requested_by: String,
+    pub queued_at: DateTime<Utc>,
+}
+
+impl From<(usize, QueuedCi)> for QueuedCiDto {
+    fn from((position, q): (usize, QueuedCi)) -> Self {
+        Self {
+            id: q.id,
+            position,
+            pr: q.pr,
+            jobs: q.jobs,
+            requested_by: q.requested_by,
+            queued_at: q.queued_at,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

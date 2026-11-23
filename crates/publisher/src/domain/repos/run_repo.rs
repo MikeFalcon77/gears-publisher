@@ -1,5 +1,5 @@
 //! Runs' metadata and logs, as the use cases need them.
-use crate::domain::models::{LiveEvent, LogLine, RunRecord};
+use crate::domain::models::{LiveEvent, LogLine, QueuedCi, RunRecord};
 use crate::domain::ports::Journal;
 use async_trait::async_trait;
 use tokio::sync::broadcast;
@@ -15,6 +15,7 @@ pub trait RunRepository: Journal {
         &self,
         run_id: Uuid,
         started_by: &str,
+        started_by_subject: Uuid,
         dry_run: bool,
         facts: serde_json::Value,
     ) -> anyhow::Result<()>;
@@ -24,4 +25,9 @@ pub trait RunRepository: Journal {
     async fn lines(&self, run_id: Uuid, after: i64, limit: u64) -> anyhow::Result<Vec<LogLine>>;
     /// Deletes the log of runs older than `days`; the runs themselves stay listed.
     async fn prune_log(&self, days: i64) -> anyhow::Result<u64>;
+    async fn enqueue_ci(&self, entry: QueuedCi) -> anyhow::Result<()>;
+    /// The PR CI queue, oldest first.
+    async fn ci_queue(&self) -> anyhow::Result<Vec<QueuedCi>>;
+    /// Removes a queue entry; `None` if it was already gone (started or cancelled).
+    async fn take_ci(&self, id: Uuid) -> anyhow::Result<Option<QueuedCi>>;
 }
