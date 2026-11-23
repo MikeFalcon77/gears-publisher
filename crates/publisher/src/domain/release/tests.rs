@@ -256,6 +256,44 @@ async fn collect_recovers_earlier_attempts_when_a_retry_succeeded() {
     );
 }
 
+/// A crate on main that cannot be published until the release PR bumps its
+/// dependencies must not hold the PR back (release-plz.yml runs them as separate jobs).
+#[tokio::test]
+async fn a_failed_catch_up_release_does_not_block_the_release_pr() {
+    let exec = release_exec()
+        .on("release-plz release -o json", |_, n| match n {
+            1 => fail(&["error: failed to verify package tarball"]),
+            2 => fail(&[RATE_LIMITED]),
+            _ => ok(RELEASED),
+        })
+        .on("release_retry.py collect", |cmd, _| {
+            if env(cmd, "OUTCOME_2").is_none() {
+                // pre_release: no attempt succeeded; releases come from tags only.
+                assert_eq!(env(cmd, "OUTCOME_1"), Some("failure"));
+                assert!(env(cmd, "RELEASES_1").is_none());
+            }
+            collect_writes(cmd, "[]")
+        })
+        .reversed();
+    let h = harness(exec, published(), &fast());
+    let run = TestRuntime::new()
+        .run(&h.workflow, ReleaseInput { dry_run: false })
+        .await
+        .unwrap();
+    assert_eq!(run.attempts("pre_release"), 1);
+    let state = run.into_output().unwrap();
+    assert_eq!(state.pre_released, Some(Vec::new()));
+    assert_eq!(state.pr.as_ref().map(|p| p.number), Some(7));
+    assert_eq!(state.publish.unwrap().releases.len(), 1);
+    assert!(
+        h.journal
+            .lines
+            .lock()
+            .iter()
+            .any(|l| l.line.contains("going on to the release PR"))
+    );
+}
+
 #[tokio::test]
 async fn nothing_to_release_skips_the_rest() {
     let exec = FakeExec::default()
@@ -334,15 +372,17 @@ async fn publish_gives_up_after_the_configured_failures() {
         .run(&h.workflow, ReleaseInput::default())
         .await
         .unwrap();
-    assert_eq!(run.attempts("pre_release"), 3);
+    // pre_release fails once and goes on; publish has the budget.
+    assert_eq!(run.attempts("pre_release"), 1);
+    assert_eq!(run.attempts("publish"), 3);
     assert_eq!(
         run.outcome(),
         &TestOutcome::Failed {
-            step: "pre_release".into(),
+            step: "publish".into(),
             code: "publish_failed".into()
         }
     );
-    assert_eq!(h.exec.calls_matching("release-plz release -o json"), 2);
+    assert_eq!(h.exec.calls_matching("release-plz release -o json"), 3);
 }
 
 #[tokio::test]

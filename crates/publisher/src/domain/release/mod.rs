@@ -861,8 +861,20 @@ async fn pre_release(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState)
     deps.ensure_tree(&scope, &state, Tree::Main).await?;
     let dir = deps.phase_dir(&scope, "pre_release")?;
     snapshot(&deps, &scope, &dir).await?;
-    let outcome = release_attempt(&deps, &scope, &dir, false).await?;
-    let released = collect(&deps, &scope, &dir, &outcome).await?;
+    // As in release-plz.yml, where `release` and `release-pr` are separate jobs, a
+    // failure here does not hold the release PR back: a crate on main may be
+    // unpublishable until the PR bumps its dependencies, and `publish` releases it
+    // after the merge. Rate limits are still waited out.
+    let outcome = try_release(&deps, &scope, &dir, false).await?;
+    if outcome.is_none() {
+        scope
+            .info(
+                "release-plz release failed on main; going on to the release PR, \
+                 whose publish retries what is left",
+            )
+            .await;
+    }
+    let released = collect(&deps, &scope, &dir, outcome.as_ref()).await?;
     if !released.is_empty() {
         scope
             .info(format!(
@@ -907,15 +919,28 @@ async fn snapshot(deps: &Deps, scope: &StepScope, dir: &Path) -> Result<(), Acti
     .map(drop)
 }
 
-/// One `release-plz release` attempt, as in `release-plz.yml`: before a retry
-/// `release_retry.py wait` (GitHub API budget, tags); `CARGO_INCREMENTAL=0`, the sparse
-/// protocol and a cleared cargo registry. Outputs go to `<dir>/release-N.{json,outcome}`.
+/// [`try_release`], a failure retried as `publish_failed`.
 async fn release_attempt(
     deps: &Deps,
     scope: &StepScope,
     dir: &Path,
     dry_run: bool,
 ) -> Result<PublishOutcome, ActivityError> {
+    try_release(deps, scope, dir, dry_run)
+        .await?
+        .ok_or_else(|| ActivityError::retryable("publish_failed"))
+}
+
+/// One `release-plz release` attempt, as in `release-plz.yml`: before a retry
+/// `release_retry.py wait` (GitHub API budget, tags); `CARGO_INCREMENTAL=0`, the sparse
+/// protocol and a cleared cargo registry. Outputs go to `<dir>/release-N.{json,outcome}`.
+/// `None`: release-plz failed for a reason other than a rate limit (recorded `failed`).
+async fn try_release(
+    deps: &Deps,
+    scope: &StepScope,
+    dir: &Path,
+    dry_run: bool,
+) -> Result<Option<PublishOutcome>, ActivityError> {
     check_publish_budget(deps, scope, dir).await?;
     let attempt = scope.attempt;
     let mut cmd = Cmd::new(&deps.config.release_plz_bin, deps.clone_dir())
@@ -985,11 +1010,11 @@ async fn release_attempt(
         scope
             .info(format!("release-plz released {} packages", releases.len()))
             .await;
-        return Ok(PublishOutcome {
+        return Ok(Some(PublishOutcome {
             attempt,
             releases,
             note: None,
-        });
+        }));
     }
 
     if dry_run {
@@ -998,11 +1023,11 @@ async fn release_attempt(
                         dependency; the crates before it passed verification";
             scope.info(note).await;
             record("success");
-            return Ok(PublishOutcome {
+            return Ok(Some(PublishOutcome {
                 attempt,
                 releases: Vec::new(),
                 note: Some(note.to_owned()),
-            });
+            }));
         }
         record("failed");
         return Err(ActivityError::permanent("publish_dry_run_failed"));
@@ -1013,7 +1038,7 @@ async fn release_attempt(
         return Err(rate_limited(deps, scope, &out).await);
     }
     record("failed");
-    Err(ActivityError::retryable("publish_failed"))
+    Ok(None)
 }
 
 /// Log the GitHub API budget of the token in use (`GET /rate_limit` is free).
@@ -1111,7 +1136,7 @@ async fn heal_tags(deps: Arc<Deps>, scope: StepScope, mut state: ReleaseState) -
     };
     deps.ensure_tree(&scope, &state, Tree::Release).await?;
     let dir = deps.phase_dir(&scope, "publish")?;
-    state.releases = Some(collect(&deps, &scope, &dir, &publish).await?);
+    state.releases = Some(collect(&deps, &scope, &dir, Some(&publish)).await?);
     Ok(state)
 }
 
@@ -1121,12 +1146,10 @@ async fn collect(
     deps: &Deps,
     scope: &StepScope,
     dir: &Path,
-    publish: &PublishOutcome,
+    publish: Option<&PublishOutcome>,
 ) -> Result<Vec<Release>, ActivityError> {
     let output = dir.join("collect-output.txt");
     let _ = std::fs::remove_file(&output);
-    let releases = serde_json::to_string(&publish.releases)
-        .map_err(|_| ActivityError::permanent("encode_failed"))?;
     let mut cmd = deps
         .release_retry(scope, "collect")
         .await?
@@ -1139,12 +1162,20 @@ async fn collect(
         .secret("GH_TOKEN", deps.gh_token(scope).await?);
     // collect knows three attempts. A first-attempt success is used as is; otherwise
     // "failure, then success" makes it recover earlier attempts' releases from tags.
-    cmd = if publish.attempt <= 1 {
-        cmd.env("OUTCOME_1", "success").env("RELEASES_1", releases)
-    } else {
-        cmd.env("OUTCOME_1", "failure")
-            .env("OUTCOME_2", "success")
-            .env("RELEASES_2", releases)
+    // Failure alone (pre_release): releases from tags only, and no tag healing.
+    cmd = match publish {
+        None => cmd.env("OUTCOME_1", "failure"),
+        Some(publish) => {
+            let releases = serde_json::to_string(&publish.releases)
+                .map_err(|_| ActivityError::permanent("encode_failed"))?;
+            if publish.attempt <= 1 {
+                cmd.env("OUTCOME_1", "success").env("RELEASES_1", releases)
+            } else {
+                cmd.env("OUTCOME_1", "failure")
+                    .env("OUTCOME_2", "success")
+                    .env("RELEASES_2", releases)
+            }
+        }
     };
     deps.run_ok(scope, cmd, ActivityError::retryable, "collect_failed")
         .await?;
