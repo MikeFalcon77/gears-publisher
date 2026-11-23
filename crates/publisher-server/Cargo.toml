@@ -11,7 +11,7 @@ workspace = true
 toolkit = { workspace = true, features = ["bootstrap"] }
 api-gateway.workspace = true
 authn-resolver.workspace = true
-firebase-authn-plugin.workspace = true
+publisher-authn = { path = "../publisher-authn" }
 types-registry.workspace = true
 publisher = { path = "../publisher" }
 anyhow.workspace = true

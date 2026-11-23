@@ -2,13 +2,18 @@
 //!
 //! `PUBLISHER_TEST_PG_URL=postgres://… cargo test -p publisher --test pg_engine -- --ignored`
 use async_trait::async_trait;
-use publisher::domain::access::{Directory, ServiceAuthorizer, service_context};
-use publisher::domain::models::Person;
+use publisher::domain::access::{ServiceAuthorizer, service_context};
+use publisher::domain::error::DomainError;
+use publisher::domain::models::{AccessStatus, Person, Role};
 use publisher::domain::ports::{Cmd, CmdOutput, Exec, ExecError, Registry, StepScope};
 use publisher::domain::release::{self as workflow, Deps, ReleaseInput};
+use publisher::domain::repos::{NewRequest, UserRepository};
 use publisher::domain::service::RunService as Service;
 use publisher::domain::steps::BuildSlot;
-use publisher::infra::db::{migrations, repo::PgRunRepository};
+use publisher::infra::db::{
+    migrations,
+    repo::{PgRunRepository, PgUserRepository},
+};
 use secrecy::SecretString;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -43,6 +48,7 @@ impl Exec for Fake {
         Ok(match cmd.display().as_str() {
             line if line.contains("release-pr") => ok(r#"{"prs":[]}"#),
             line if line.contains("auth token") => ok("gho_token_x\n"),
+            line if line.contains("rev-parse") => ok("abc123\n"),
             _ => ok(""),
         })
     }
@@ -56,6 +62,17 @@ impl Registry for NoRegistry {
     }
 }
 
+/// The gear's migrations, once at a time: tests run in parallel on one database.
+async fn migrate(db: &toolkit_db::Db) {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = LOCK.lock().await;
+    let mut all = migrations::all();
+    all.extend(toolkit_durable_execution::migrations());
+    toolkit_db::migration_runner::run_migrations_for_gear(db, "publisher", all)
+        .await
+        .unwrap();
+}
+
 struct Server {
     service: Arc<Service>,
     stop: CancellationToken,
@@ -66,11 +83,7 @@ async fn start(url: &str, queue: &str, work: &std::path::Path, exec: Arc<dyn Exe
     let db = toolkit_db::connect_db(url, toolkit_db::ConnectOpts::default())
         .await
         .unwrap();
-    let mut migrations = migrations::all();
-    migrations.extend(toolkit_durable_execution::migrations());
-    toolkit_db::migration_runner::run_migrations_for_gear(&db, "publisher", migrations)
-        .await
-        .unwrap();
+    migrate(&db).await;
     let store = Arc::new(PgRunRepository::new(toolkit_db::DBProvider::new(
         db.clone(),
     )));
@@ -108,7 +121,6 @@ async fn start(url: &str, queue: &str, work: &std::path::Path, exec: Arc<dyn Exe
             .with_poll_interval(Duration::from_millis(100)),
         engine.inspector(),
         store,
-        Directory::default(),
         service_context(),
         None,
     ));
@@ -157,6 +169,28 @@ async fn wait_for(
     }
 }
 
+/// A member may not start a release, nor control one.
+async fn a_member_cannot_touch_it(service: &Service, admin: &Person, id: uuid::Uuid) {
+    let member = Person {
+        role: Role::Member,
+        ..admin.clone()
+    };
+    assert!(matches!(
+        service
+            .start_release(&member, ReleaseInput::default())
+            .await,
+        Err(DomainError::AdminOnly)
+    ));
+    assert!(matches!(
+        service.cancel(&member, id).await,
+        Err(DomainError::AdminOnly)
+    ));
+    assert!(matches!(
+        service.retry(&member, id).await,
+        Err(DomainError::AdminOnly)
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PUBLISHER_TEST_PG_URL"]
 async fn a_run_continues_after_a_restart_in_the_middle_of_a_step() {
@@ -166,9 +200,10 @@ async fn a_run_continues_after_a_restart_in_the_middle_of_a_step() {
     let queue = format!("publisher-test-{}", uuid::Uuid::new_v4().simple());
     let person = Person {
         uid: "u".into(),
-        email: "tester@example.com".into(),
+        email: Some("tester@example.com".into()),
+        name: None,
+        role: Role::Admin,
     };
-
     let first = start(
         &url,
         &queue,
@@ -183,6 +218,7 @@ async fn a_run_continues_after_a_restart_in_the_middle_of_a_step() {
         .start_release(&person, ReleaseInput { dry_run: false })
         .await
         .unwrap();
+    a_member_cannot_touch_it(&first.service, &person, id).await;
     // A second start while one is active is refused.
     assert!(
         first
@@ -245,4 +281,57 @@ async fn a_run_continues_after_a_restart_in_the_middle_of_a_step() {
     );
     second.stop.cancel();
     second.task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PUBLISHER_TEST_PG_URL"]
+async fn access_requests_round_trip_in_postgres() {
+    let url = std::env::var("PUBLISHER_TEST_PG_URL").expect("PUBLISHER_TEST_PG_URL");
+    let db = toolkit_db::connect_db(&url, toolkit_db::ConnectOpts::default())
+        .await
+        .unwrap();
+    migrate(&db).await;
+    let users = PgUserRepository::new(toolkit_db::DBProvider::new(db));
+    let subject = uuid::Uuid::new_v4();
+    let request = |note: &str| NewRequest {
+        subject_id: subject,
+        uid: format!("uid-{subject}"),
+        email: None,
+        name: Some("Вася Иванов".into()),
+        provider: Some("github.com".into()),
+        note: note.into(),
+    };
+    // A refused insert reports the database's error, not a vanished request.
+    let refused = users.request(request("nul\0byte")).await.unwrap_err();
+    assert!(!format!("{refused:#}").contains("vanished"), "{refused:#}");
+    let first = users.request(request("first")).await.unwrap();
+    assert_eq!(first.status, AccessStatus::Pending);
+    assert_eq!(
+        users.request(request("edited")).await.unwrap().note,
+        "edited"
+    );
+    assert!(
+        users
+            .list(Some(AccessStatus::Pending))
+            .await
+            .unwrap()
+            .iter()
+            .any(|u| u.subject_id == subject)
+    );
+    let approved = users
+        .decide(subject, AccessStatus::Approved, "root@example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(approved.status, AccessStatus::Approved);
+    assert_eq!(approved.decided_by.as_deref(), Some("root@example.com"));
+    // A decided request keeps its note.
+    assert_eq!(users.request(request("late")).await.unwrap().note, "edited");
+    assert!(
+        users
+            .decide(uuid::Uuid::new_v4(), AccessStatus::Rejected, "x")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

@@ -16,7 +16,7 @@ const BASE = '/publisher/v1';
 
 async function authorized(force: boolean): Promise<string> {
   const jwt = await token(force);
-  if (!jwt) throw new ApiError(401, 'Sign in with Google');
+  if (!jwt) throw new ApiError(401, 'Sign in first');
   return jwt;
 }
 

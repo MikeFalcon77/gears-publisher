@@ -66,6 +66,24 @@ pub fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         "publisher.retry_run",
         handlers::retry_run
     );
+    endpoint!(
+        post,
+        "/publisher/v1/access-request",
+        "publisher.request_access",
+        handlers::request_access
+    );
+    endpoint!(
+        get,
+        "/publisher/v1/admin/users",
+        "publisher.list_access",
+        handlers::list_access
+    );
+    endpoint!(
+        post,
+        "/publisher/v1/admin/users/{subject}/{action}",
+        "publisher.decide_access",
+        handlers::decide_access
+    );
     router = OperationBuilder::get("/publisher/v1/runs/{id}/stream")
         .operation_id("publisher.stream_run")
         .authenticated()
@@ -74,11 +92,17 @@ pub fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .sse_json::<LogLineDto>(openapi, "Log lines (`log`) and run updates (`run`)")
         .register(router, openapi);
 
+    register_ui(router, openapi)
+}
+
+/// The UI shell for each page, and its static files.
+fn register_ui(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     for (path, id) in [
         ("/", "publisher.ui_index"),
         ("/index.html", "publisher.ui_index_html"),
         ("/runs/{id}", "publisher.ui_run"),
         ("/ci", "publisher.ui_ci"),
+        ("/admin", "publisher.ui_admin"),
     ] {
         router = OperationBuilder::get(path)
             .operation_id(id)

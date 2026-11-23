@@ -1,4 +1,4 @@
-import type { RecordedTime, ReleaseFacts, RunHistory, RunProgress, RunState, RunSummary } from './types';
+import type { RecordedTime, ReleaseFacts, Role, RunHistory, RunProgress, RunState, RunSummary } from './types';
 
 export type StepStatus =
   | 'pending'
@@ -118,6 +118,16 @@ export function actions(state: RunState): Actions {
     resume: state.kind === 'cancelled',
     retry: state.kind === 'failed' || state.kind === 'compensation_failed',
   };
+}
+
+/** Members control PR CI runs only; releases are an admin's. */
+export function canControl(role: Role, kind: 'release' | 'ci'): boolean {
+  return role === 'admin' || (role === 'member' && kind === 'ci');
+}
+
+/** What this person may do with a run in this state. */
+export function permittedActions(role: Role, kind: 'release' | 'ci', state: RunState): Actions {
+  return canControl(role, kind) ? actions(state) : { cancel: false, resume: false, retry: false };
 }
 
 export function isActive(progress: RunProgress): boolean {

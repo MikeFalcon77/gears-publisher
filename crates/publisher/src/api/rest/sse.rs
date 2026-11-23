@@ -46,7 +46,7 @@ pub async fn stream_run(
     Path(id): Path<Uuid>,
     Query(q): Query<StreamQuery>,
 ) -> Result<Response, ApiError> {
-    app.service.person(&ctx)?;
+    app.access.person(&ctx).await?;
     // Fails with 404 before the stream starts.
     let first = app.service.progress(id).await?;
     let (tx, rx) = mpsc::channel::<Event>(256);

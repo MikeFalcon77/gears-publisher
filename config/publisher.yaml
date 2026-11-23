@@ -52,17 +52,13 @@ gears:
     config:
       vendor: constructorfabric
 
-  firebase-authn-plugin:
+  # Admits every verified Firebase user (Google, GitHub); the publisher gear decides
+  # what each may do: config admins, approved users, or a request for access.
+  publisher-authn-plugin:
     config:
       project_id: "${FIREBASE_PROJECT_ID}"
-      # People allowed in: Firebase uid + verified email. A new person signs in once,
-      # copies the uid shown on "Access denied" and is added here; then restart.
-      # The publisher gear reads the same list (anchor below) to name who did what.
-      identities: &identities
-        - uid: "REPLACE_WITH_FIREBASE_UID"
-          email: "someone@example.com"
-          tenant_id: "67656172-732d-7075-626c-697368657201"
-          token_scopes: ["publisher"]
+      # The tenant of every subject; equals the publisher's run tenant.
+      tenant_id: "67656172-732d-7075-626c-697368657201"
 
   publisher:
     database:
@@ -78,7 +74,12 @@ gears:
       clean_cargo_home: "${PUBLISHER_CLEAN_CARGO_HOME:-}"
       queue_dsn: "${DATABASE_URL}"
       firebase_project_id: "${FIREBASE_PROJECT_ID}"
-      users: *identities
+      # Admins: they start releases and approve access requests on /admin. Firebase
+      # uid + email (the email only names them). Everyone else asks for access in the
+      # UI and, once approved, may run PR CI and read releases.
+      admins:
+        - uid: "REPLACE_WITH_FIREBASE_UID"
+          email: "someone@example.com"
       # Build user for everything that runs gears-rust's code (sudo -u); empty locally.
       run_as: "${PUBLISHER_RUN_AS:-}"
       # PR CI runs a pull request's code: as its own user, in its own clone and target,

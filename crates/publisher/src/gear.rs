@@ -5,11 +5,14 @@ use crate::domain::access::{Directory, ServiceAuthorizer, service_context};
 use crate::domain::ci::{self, CiDeps};
 use crate::domain::ports::{Exec, Journal};
 use crate::domain::release::{self, Deps};
-use crate::domain::repos::RunRepository;
-use crate::domain::service::RunService;
+use crate::domain::repos::{RunRepository, UserRepository};
+use crate::domain::service::{AccessService, RunService};
 use crate::domain::steps::BuildSlot;
 use crate::infra::crates_io::SparseIndex;
-use crate::infra::db::{migrations, repo::PgRunRepository};
+use crate::infra::db::{
+    migrations,
+    repo::{PgRunRepository, PgUserRepository},
+};
 use crate::infra::exec::{ProcessExec, RefuseUntrusted, RunAs};
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -37,6 +40,7 @@ pub struct PublisherGear {
     release: OnceLock<Arc<Deps>>,
     ci: OnceLock<Arc<CiDeps>>,
     service: OnceLock<Arc<RunService>>,
+    access: OnceLock<Arc<AccessService>>,
     repository: OnceLock<String>,
     web_root: OnceLock<PathBuf>,
     firebase_project_id: OnceLock<String>,
@@ -85,9 +89,15 @@ impl Gear for PublisherGear {
         let engine = Engine::builder(db.db(), Arc::new(ServiceAuthorizer))
             .mode(ExecutionMode::Worker(queue))
             .build()?;
-        if config.users.is_empty() {
-            tracing::warn!("publisher.users is empty: nobody can start a run");
+        if config.admins.is_empty() {
+            tracing::warn!(
+                "publisher.admins is empty: nobody can start a release or approve access"
+            );
         }
+        let access = Arc::new(AccessService::new(
+            Directory::from_config(&config),
+            Arc::new(PgUserRepository::new(db.clone())) as Arc<dyn UserRepository>,
+        ));
         let ci_refusal = config.ci_refusal();
         if let Some(refusal) = ci_refusal {
             tracing::warn!(refusal, "PR CI is disabled");
@@ -96,7 +106,6 @@ impl Gear for PublisherGear {
             engine.client(),
             engine.inspector(),
             Arc::clone(&repo) as Arc<dyn RunRepository>,
-            Directory::from_config(&config),
             service_context(),
             ci_refusal,
         ));
@@ -149,6 +158,7 @@ impl Gear for PublisherGear {
         self.release.set(release).map_err(|_| already())?;
         self.ci.set(ci).map_err(|_| already())?;
         self.service.set(service).map_err(|_| already())?;
+        self.access.set(access).map_err(|_| already())?;
         *self.engine.lock() = Some(engine);
         Ok(())
     }
@@ -229,6 +239,7 @@ impl RestApiCapability for PublisherGear {
         let not_ready = || anyhow::anyhow!("publisher gear is not initialized");
         let state = AppState {
             service: Arc::clone(self.service.get().ok_or_else(not_ready)?),
+            access: Arc::clone(self.access.get().ok_or_else(not_ready)?),
             repository: self.repository.get().ok_or_else(not_ready)?.clone(),
             web_root: self.web_root.get().ok_or_else(not_ready)?.clone(),
             csp: rest::content_security_policy(

@@ -2,7 +2,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use toolkit::bootstrap::{AppConfig, run_migrate, run_server};
 use {
-    api_gateway as _, authn_resolver as _, firebase_authn_plugin as _, publisher as _,
+    api_gateway as _, authn_resolver as _, publisher as _, publisher_authn as _,
     types_registry as _,
 };
 

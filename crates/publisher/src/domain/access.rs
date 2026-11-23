@@ -1,13 +1,16 @@
 //! Who may do what.
 //!
-//! The allowlist is enforced by `firebase-authn-plugin`: a request that reaches an
-//! authenticated route already belongs to a configured account. Durable runs, however,
+//! `publisher-authn-plugin` admits **every** verified Firebase user, so a request on an
+//! authenticated route proves who is calling and nothing more. The decision is made
+//! here (see `service::AccessService`): admins come from `publisher.admins`; anyone
+//! else is a member only once an admin approved their request, and may otherwise do
+//! nothing but ask. Durable runs, however,
 //! are visible only to the subject that started them, and a release is a team effort:
 //! anyone on the list must see and retry anyone's run. So the gear starts and controls
 //! every run as one service identity, and records the human who pressed the button
 //! in its own `publisher_runs` table.
 use crate::config::PublisherConfig;
-use crate::domain::models::Person;
+use crate::domain::models::{Person, Role};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use toolkit_durable_execution::{
@@ -63,7 +66,7 @@ impl Authorizer for ServiceAuthorizer {
     }
 }
 
-/// Maps authenticated subject ids back to configured accounts.
+/// The configured admins, by subject id.
 #[derive(Debug, Default)]
 pub struct Directory {
     by_subject: HashMap<Uuid, Person>,
@@ -73,7 +76,7 @@ impl Directory {
     #[must_use]
     pub fn from_config(config: &PublisherConfig) -> Self {
         let by_subject = config
-            .users
+            .admins
             .iter()
             .map(|user| {
                 (
@@ -84,7 +87,9 @@ impl Directory {
                     ),
                     Person {
                         uid: user.uid.clone(),
-                        email: user.email.clone(),
+                        email: Some(user.email.clone()),
+                        name: None,
+                        role: Role::Admin,
                     },
                 )
             })
@@ -92,14 +97,24 @@ impl Directory {
         Self { by_subject }
     }
 
-    /// The person behind an authenticated request, if configured here too.
+    /// The admin behind an authenticated request, if it is one.
     #[must_use]
-    pub fn person(&self, ctx: &SecurityContext) -> Option<&Person> {
+    pub fn admin(&self, ctx: &SecurityContext) -> Option<&Person> {
         self.by_subject.get(&ctx.subject_id())
+    }
+
+    #[must_use]
+    pub fn is_admin(&self, subject: Uuid) -> bool {
+        self.by_subject.contains_key(&subject)
+    }
+
+    /// Every admin, by subject id.
+    pub fn admins(&self) -> impl Iterator<Item = (&Uuid, &Person)> {
+        self.by_subject.iter()
     }
 }
 
-/// The subject id `firebase-authn-plugin` assigns to a uid.
+/// The subject id `publisher-authn-plugin` assigns to a uid.
 #[must_use]
 pub fn subject_id(namespace: &Uuid, project_id: &str, uid: &str) -> Uuid {
     Uuid::new_v5(

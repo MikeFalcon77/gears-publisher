@@ -1,6 +1,5 @@
 //! Use cases behind the REST API. Every durable call uses the service identity;
 //! see [`crate::domain::access`].
-use crate::domain::access::Directory;
 use crate::domain::ci::{self, CiInput, CiState};
 use crate::domain::error::{DomainError, Result};
 use crate::domain::models::{
@@ -37,7 +36,6 @@ pub struct RunService {
     inspector: ExecutionInspector,
     pub workflows: Workflows,
     repo: Arc<dyn RunRepository>,
-    directory: Directory,
     service_ctx: SecurityContext,
     /// Why PR CI cannot run on this host, if it cannot.
     ci_refusal: Option<&'static str>,
@@ -50,7 +48,6 @@ impl RunService {
         client: ExecutionClient,
         inspector: ExecutionInspector,
         repo: Arc<dyn RunRepository>,
-        directory: Directory,
         service_ctx: SecurityContext,
         ci_refusal: Option<&'static str>,
     ) -> Self {
@@ -59,16 +56,10 @@ impl RunService {
             inspector,
             workflows: Workflows::default(),
             repo,
-            directory,
             service_ctx,
             ci_refusal,
             start_lock: tokio::sync::Mutex::new(()),
         }
-    }
-
-    /// The configured person behind a request.
-    pub fn person(&self, ctx: &SecurityContext) -> Result<&Person> {
-        self.directory.person(ctx).ok_or(DomainError::Forbidden)
     }
 
     /// Why PR CI is unavailable, if it is.
@@ -165,6 +156,7 @@ impl RunService {
 
     /// Start a release unless one is in progress.
     pub async fn start_release(&self, person: &Person, input: ReleaseInput) -> Result<Uuid> {
+        ensure_may_control(person, RunKind::Release)?;
         let workflow = self.workflows.release.get().ok_or(DomainError::Starting)?;
         let _guard = self.start_lock.lock().await;
         self.ensure_exclusive(RunKind::Release, None).await?;
@@ -176,9 +168,9 @@ impl RunService {
         let run_id = started.run_id().0;
         self.record(person, run_id, dry_run, serde_json::json!({}))
             .await?;
-        tracing::info!(%run_id, by = %person.email, dry_run, "release started");
+        tracing::info!(%run_id, by = %person.label(), dry_run, "release started");
         let what = if dry_run { "dry run" } else { "release" };
-        self.control_note(run_id, format!("{what} started by {}", person.email))
+        self.control_note(run_id, format!("{what} started by {}", person.label()))
             .await;
         Ok(run_id)
     }
@@ -191,6 +183,7 @@ impl RunService {
         pr: u64,
         jobs: Option<Vec<String>>,
     ) -> Result<Uuid> {
+        ensure_may_control(person, RunKind::Ci)?;
         if let Some(refusal) = self.ci_refusal {
             return Err(DomainError::Unavailable(refusal.to_owned()));
         }
@@ -253,13 +246,13 @@ impl RunService {
         let run_id = started.run_id().0;
         let facts = serde_json::json!({ "pr_number": pr, "only": jobs });
         self.record(person, run_id, false, facts).await?;
-        tracing::info!(%run_id, by = %person.email, pr, "PR CI started");
+        tracing::info!(%run_id, by = %person.label(), pr, "PR CI started");
         let rerun = jobs
             .map(|ids| format!(" (re-run of {})", ids.join(", ")))
             .unwrap_or_default();
         self.control_note(
             run_id,
-            format!("PR #{pr} CI started by {}{rerun}", person.email),
+            format!("PR #{pr} CI started by {}{rerun}", person.label()),
         )
         .await;
         Ok(run_id)
@@ -275,7 +268,7 @@ impl RunService {
     ) -> Result<()> {
         let Err(error) = self
             .repo
-            .create_run(run_id, &person.email, dry_run, facts)
+            .create_run(run_id, person.label(), dry_run, facts)
             .await
         else {
             return Ok(());
@@ -323,7 +316,10 @@ impl RunService {
     }
 
     pub async fn cancel(&self, person: &Person, id: Uuid) -> Result<()> {
-        let epoch = self.progress(id).await?.epoch;
+        let progress = self.progress(id).await?;
+        let kind = RunKind::of(&progress.definition).ok_or(DomainError::NotFound)?;
+        ensure_may_control(person, kind)?;
+        let epoch = progress.epoch;
         self.client
             .cancel(
                 &self.service_ctx,
@@ -338,6 +334,7 @@ impl RunService {
     pub async fn resume(&self, person: &Person, id: Uuid) -> Result<()> {
         let _guard = self.start_lock.lock().await;
         let (progress, kind) = self.kind(id).await?;
+        ensure_may_control(person, kind)?;
         self.ensure_exclusive(kind, Some(id)).await?;
         // Noted before the engine is told: the worker's first lines of the new attempt
         // must come after the note that opens it in the UI.
@@ -361,6 +358,7 @@ impl RunService {
     pub async fn retry(&self, person: &Person, id: Uuid) -> Result<()> {
         let _guard = self.start_lock.lock().await;
         let (progress, kind) = self.kind(id).await?;
+        ensure_may_control(person, kind)?;
         self.ensure_exclusive(kind, Some(id)).await?;
         self.after_command(person, id, "retry").await;
         if let Err(error) = self
@@ -380,8 +378,8 @@ impl RunService {
     }
 
     async fn after_command(&self, person: &Person, id: Uuid, command: &str) {
-        tracing::info!(run_id = %id, by = %person.email, command, "run command");
-        self.control_note(id, format!("{command} requested by {}", person.email))
+        tracing::info!(run_id = %id, by = %person.label(), command, "run command");
+        self.control_note(id, format!("{command} requested by {}", person.label()))
             .await;
     }
 
@@ -406,5 +404,14 @@ impl RunService {
     /// Daily: delete the logs of runs that have dropped out of the run list.
     pub async fn prune_logs(&self) -> anyhow::Result<u64> {
         self.repo.prune_log(LIST_DAYS).await
+    }
+}
+
+/// Members control PR CI runs only; releases are an admin's.
+fn ensure_may_control(person: &Person, kind: RunKind) -> Result<()> {
+    if person.may_control(kind) {
+        Ok(())
+    } else {
+        Err(DomainError::AdminOnly)
     }
 }

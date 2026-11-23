@@ -176,10 +176,40 @@ export interface LogLine {
   ts: string;
 }
 
+/** `none`: signed in, never asked for access. */
+export type Role = 'admin' | 'member' | 'pending' | 'rejected' | 'none';
+
 export interface Me {
   uid: string;
-  email: string;
+  email: string | null;
+  name: string | null;
+  role: Role;
+  /** The note of a pending or rejected request. */
+  note: string | null;
+  /** Requests waiting for a decision; admins only. */
+  pending_requests: number | null;
   /** Release steps. */
   steps: string[];
   ci: CiInfo;
+}
+
+export type AccessStatus = 'pending' | 'approved' | 'rejected';
+
+export interface UserEntry {
+  subject_id: string;
+  uid: string;
+  email: string | null;
+  name: string | null;
+  /** `google.com`, `github.com`, ... */
+  provider: string | null;
+  note: string;
+  status: AccessStatus;
+  requested_at: string;
+  decided_at: string | null;
+  decided_by: string | null;
+}
+
+export interface AccessList {
+  admins: { uid: string; email: string | null }[];
+  users: UserEntry[];
 }

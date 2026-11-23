@@ -3,6 +3,7 @@
 pub mod access;
 pub mod ci;
 pub mod error;
+pub mod identity;
 pub mod models;
 pub mod ports;
 pub mod release;

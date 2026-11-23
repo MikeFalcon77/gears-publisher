@@ -1,6 +1,8 @@
 //! Request and response bodies.
 use crate::domain::ci;
-use crate::domain::models::{LogLine, RunDetail, RunKind, RunRecord, RunSummary};
+use crate::domain::models::{
+    AccessStatus, LogLine, Person, RunDetail, RunKind, RunRecord, RunSummary, UserRecord,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use toolkit_durable_execution::observation::{RunHistory, RunProgress};
@@ -124,7 +126,14 @@ impl From<RunDetail> for RunDetailDto {
 #[derive(Debug, Serialize)]
 pub struct MeDto {
     pub uid: String,
-    pub email: String,
+    pub email: Option<String>,
+    pub name: Option<String>,
+    /// `admin`, `member`, `pending`, `rejected` or `none` (signed in, never asked).
+    pub role: &'static str,
+    /// The note of a pending or rejected request.
+    pub note: Option<String>,
+    /// Requests waiting for a decision; admins only.
+    pub pending_requests: Option<usize>,
     /// Release step ids.
     pub steps: &'static [&'static str],
     pub ci: CiInfoDto,
@@ -204,4 +213,72 @@ pub struct AcceptedDto {
 pub struct LogQuery {
     pub after: i64,
     pub limit: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AccessRequestReq {
+    pub note: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserDto {
+    pub subject_id: Uuid,
+    pub uid: String,
+    pub email: Option<String>,
+    pub name: Option<String>,
+    pub provider: Option<String>,
+    pub note: String,
+    pub status: &'static str,
+    pub requested_at: DateTime<Utc>,
+    pub decided_at: Option<DateTime<Utc>>,
+    pub decided_by: Option<String>,
+}
+
+impl From<UserRecord> for UserDto {
+    fn from(u: UserRecord) -> Self {
+        Self {
+            subject_id: u.subject_id,
+            uid: u.uid,
+            email: u.email,
+            name: u.name,
+            provider: u.provider,
+            note: u.note,
+            status: u.status.as_str(),
+            requested_at: u.requested_at,
+            decided_at: u.decided_at,
+            decided_by: u.decided_by,
+        }
+    }
+}
+
+/// A configured admin, shown read-only.
+#[derive(Debug, Serialize)]
+pub struct AdminDto {
+    pub uid: String,
+    pub email: Option<String>,
+}
+
+impl From<Person> for AdminDto {
+    fn from(p: Person) -> Self {
+        Self {
+            uid: p.uid,
+            email: p.email,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct AccessListDto {
+    pub admins: Vec<AdminDto>,
+    pub users: Vec<UserDto>,
+}
+
+/// `approve` or `reject` in the path.
+#[must_use]
+pub fn decision(action: &str) -> Option<AccessStatus> {
+    match action {
+        "approve" => Some(AccessStatus::Approved),
+        "reject" => Some(AccessStatus::Rejected),
+        _ => None,
+    }
 }

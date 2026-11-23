@@ -5,7 +5,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { api } from './api';
 import { navigate } from './router';
 import {
-  actions,
+  permittedActions,
   currentStep,
   formatDuration,
   formatTime,
@@ -64,7 +64,7 @@ export function RunPage({ id, me }: { id: string; me: Me }) {
   const steps = me.steps;
   const views = stepViews(steps, run);
   const current = currentStep(views);
-  const allowed = actions(run.progress.state);
+  const allowed = permittedActions(me.role, 'release', run.progress.state);
   const facts = run.record?.facts ?? {};
   const next = guidance(views, run);
   // A real release that published something gets a report; a dry run keeps its facts.
@@ -79,6 +79,7 @@ export function RunPage({ id, me }: { id: string; me: Me }) {
           busy={command.isPending}
           onRetry={allowed.retry ? () => command.mutate('retry') : undefined}
           onResume={allowed.resume ? () => command.mutate('resume') : undefined}
+          canStart={me.role === 'admin'}
         />
         <section className="space-y-3 rounded-xl bg-white p-4 shadow-sm ring-1 ring-slate-200">
           <button
@@ -163,11 +164,14 @@ function NextStep({
   busy,
   onRetry,
   onResume,
+  canStart,
 }: {
   next: Guidance;
   busy: boolean;
   onRetry?: () => void;
   onResume?: () => void;
+  /** Only admins start releases. */
+  canStart: boolean;
 }) {
   const style = nextStyle[next.kind];
   const Icon = style.icon;
@@ -202,7 +206,7 @@ function NextStep({
               <Play className="h-4 w-4" /> Resume
             </Button>
           )}
-          {next.button === 'new_release' && (
+          {next.button === 'new_release' && canStart && (
             <Button variant={next.kind === 'action' ? 'primary' : undefined} onClick={() => navigate('/')}>
               Start a new release
             </Button>

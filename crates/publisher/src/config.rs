@@ -104,21 +104,22 @@ pub struct PublisherConfig {
     /// crates.io sparse index root.
     #[serde(default = "defaults::crates_index")]
     pub crates_index_url: String,
-    /// Firebase project and namespace: must match `firebase-authn-plugin`, so the
-    /// gear derives the same subject ids and can name who started a run.
+    /// Firebase project and namespace: must match `publisher-authn-plugin`, so the
+    /// gear derives the same subject ids.
     #[expand_vars]
     pub firebase_project_id: String,
     #[serde(default = "defaults::subject_namespace")]
     pub subject_namespace: Uuid,
-    /// The plugin's `identities` (share them with a YAML anchor).
-    #[serde(default)]
-    pub users: Vec<User>,
+    /// Admins: releases, PR CI and approving access requests. Everyone else asks
+    /// for access in the UI. `users` is the name before access requests existed.
+    #[serde(default, alias = "users")]
+    pub admins: Vec<User>,
     /// Steps' tunables.
     #[serde(default)]
     pub timings: Timings,
 }
 
-/// One allowlisted account. Extra plugin fields (`tenant_id`, `token_scopes`) are ignored.
+/// One admin. Fields of the old plugin list (`tenant_id`, `token_scopes`) are ignored.
 #[derive(Debug, Clone, Deserialize, toolkit_macros::ExpandVars)]
 pub struct User {
     #[expand_vars]

@@ -6,7 +6,7 @@ mod handlers;
 mod routes;
 mod sse;
 
-use crate::domain::service::RunService;
+use crate::domain::service::{AccessService, RunService};
 use axum::{
     Extension, Router,
     http::header,
@@ -19,6 +19,7 @@ use toolkit::api::OpenApiRegistry;
 
 pub struct AppState {
     pub service: Arc<RunService>,
+    pub access: Arc<AccessService>,
     /// `owner/name` of the repository, for links.
     pub repository: String,
     pub web_root: PathBuf,

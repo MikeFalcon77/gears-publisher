@@ -4,7 +4,7 @@
 #   deploy/deploy.sh provision <ip>            sync sources, install everything (once; idempotent)
 #   deploy/deploy.sh secrets <ip> <env-file>   copy CARGO_REGISTRY_TOKEN (and the optional
 #                                              read-only GITHUB_CI_TOKEN for PR CI) from a local .env
-#   deploy/deploy.sh config <ip>               install config/publisher.yaml (overwrites the allowlist!)
+#   deploy/deploy.sh config <ip>               install config/publisher.yaml (overwrites the admin list!)
 #   deploy/deploy.sh app <ip>                  sync, build UI and server on the host, restart
 #   deploy/deploy.sh status <ip>               service state and recent log
 #

@@ -8,7 +8,8 @@ import type { RunSummary } from './types';
 import { Badge, Button, ErrorNote } from './ui';
 import { Quip } from './irony';
 
-export function RunsPage({ steps }: { steps: string[] }) {
+/** `canStart`: admins start releases; members follow them read-only. */
+export function RunsPage({ steps, canStart }: { steps: string[]; canStart: boolean }) {
   const client = useQueryClient();
   const runs = useQuery({
     queryKey: ['runs', 'release'],
@@ -38,33 +39,39 @@ export function RunsPage({ steps }: { steps: string[] }) {
           </p>
           <Quip className="mt-0.5">Everything release-plz.yml did on GitHub Actions, back when GitHub let us.</Quip>
         </div>
-        <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            checked={dryRun}
-            onChange={(e) => {
-              setDryRun(e.target.checked);
-              setConfirming(false);
-            }}
-          />
-          dry run
-        </label>
-        {confirming ? (
+        {canStart ? (
           <>
-            <Button onClick={() => setConfirming(false)}>Back</Button>
-            <Button variant="danger" disabled={start.isPending} onClick={() => start.mutate()}>
-              <Play className="h-4 w-4" /> Confirm: publish to crates.io
-            </Button>
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={dryRun}
+                onChange={(e) => {
+                  setDryRun(e.target.checked);
+                  setConfirming(false);
+                }}
+              />
+              dry run
+            </label>
+            {confirming ? (
+              <>
+                <Button onClick={() => setConfirming(false)}>Back</Button>
+                <Button variant="danger" disabled={start.isPending} onClick={() => start.mutate()}>
+                  <Play className="h-4 w-4" /> Confirm: publish to crates.io
+                </Button>
+              </>
+            ) : (
+              <Button
+                variant="primary"
+                disabled={start.isPending || Boolean(active)}
+                title={active ? 'A run is in progress' : undefined}
+                onClick={() => (dryRun ? start.mutate() : setConfirming(true))}
+              >
+                <Play className="h-4 w-4" /> {dryRun ? 'Start dry run' : 'Start release'}
+              </Button>
+            )}
           </>
         ) : (
-          <Button
-            variant="primary"
-            disabled={start.isPending || Boolean(active)}
-            title={active ? 'A run is in progress' : undefined}
-            onClick={() => (dryRun ? start.mutate() : setConfirming(true))}
-          >
-            <Play className="h-4 w-4" /> {dryRun ? 'Start dry run' : 'Start release'}
-          </Button>
+          <p className="text-sm text-slate-500">Admins start releases; you can follow them here.</p>
         )}
       </section>
       <ErrorNote error={start.error} />

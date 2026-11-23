@@ -80,9 +80,30 @@ under the old name, it fails with `DEFINITION_CONFLICT`.
 ### Who sees what
 
 Durable runs normally belong to the subject that started them. A release is shared work, so the
-gear starts and controls every run as a single service identity. The allowlist is enforced by
-`firebase-authn-plugin`, before a request reaches the gear. `publisher_runs.started_by` and the
+gear starts and controls every run as a single service identity. `publisher_runs.started_by` and the
 `control` lines in the log record who started a run or pressed Cancel, Resume or Retry.
+
+### Access
+
+`publisher-authn-plugin` (in this workspace, derived from `cf-gears-firebase-authn-plugin`) admits
+every verified Firebase user, Google or GitHub. The gear decides what each may do
+(`domain/service/access_service.rs`):
+
+| Who | How they get there | May |
+|---|---|---|
+| admin | `publisher.admins` in publisher.yaml | everything, and approve access requests on `/admin` |
+| member | an admin approved their request | start, rerun and cancel PR CI; follow releases read-only |
+| pending | signed in and asked, with a note ("name, why") | edit the note and wait |
+| rejected | an admin rejected or revoked them | nothing |
+| anyone else | signed in | ask for access |
+
+Requests live in `publisher_users`; at most 500 wait at once. Admins are not stored there and
+cannot be approved, rejected or promoted in the UI.
+
+Upgrading a host from the allowlist: in `/etc/gears-publisher/publisher.yaml`, replace the
+`firebase-authn-plugin` block with `publisher-authn-plugin` (`project_id`, `tenant_id`, as in
+`config/publisher.yaml`) before `deploy.sh app`; the new plugin refuses to start without them.
+`publisher.users` keeps working as the admin list (`admins` is its new name).
 
 ## PR CI
 
@@ -129,7 +150,7 @@ crates/publisher          the gear, layered like gears-rust's gears:
   src/infra                 PostgreSQL (entities, migrations, repository), subprocesses, crates.io
   src/gear.rs, config.rs    wiring and configuration
 web/                      React 19 + Vite + Tailwind UI
-config/publisher.yaml     application config (allowlist, paths)
+config/publisher.yaml     application config (admins, paths)
 deploy/                   provisioning, systemd, Caddy, deploy script, Virtuozzo spec
 ```
 
@@ -189,6 +210,9 @@ into the flexible part; the rest of the time the host is idle and waits for merg
    firebase deploy --only auth --project <id>
    node deploy/firebase-domain.mjs <id> <ip-with-dashes>.sslip.io
    ```
+   GitHub sign-in (manual): create a GitHub OAuth App (Settings → Developer settings → OAuth
+   Apps) with the callback URL `https://<id>.firebaseapp.com/__/auth/handler`, then enable GitHub
+   in Firebase Console → Authentication → Sign-in method with its client id and secret.
 3. **Provision:** `FIREBASE_PROJECT_ID=<id> deploy/deploy.sh provision <ip>`. This installs the
    packages, Go, protoc, gh, Node 24, PostgreSQL 16, Caddy, the `publisher`, `publisher-build` and
    `publisher-ci` users with their own rustup, the cargo tools (release-plz, cargo-gears, nextest,
@@ -208,9 +232,10 @@ into the flexible part; the rest of the time the host is idle and waits for merg
    `gh auth login --with-token`.
 6. **App:** `deploy/deploy.sh app <ip>` builds the UI and the release binary on the host (as
    `publisher`), installs them root-owned and restarts the service.
-7. **Access:** each person signs in once. The *Access denied* page shows their uid and email; add
-   them under `firebase-authn-plugin.identities` in `/etc/gears-publisher/publisher.yaml` (or in
-   `config/publisher.yaml`, then `deploy/deploy.sh config <ip>`), then restart.
+7. **Access:** admins go under `publisher.admins` (Firebase uid and email) in
+   `/etc/gears-publisher/publisher.yaml`, then restart. `deploy/deploy.sh config <ip>` overwrites
+   that file with `config/publisher.yaml`, admins included. Everyone else signs in, asks for
+   access, and an admin approves them on `/admin`; no restart.
 
 Restarting the service in the middle of a step runs that step again from the beginning. That is safe
 for every step: publishing skips crates that are already published. Deploying during a long `checks`
@@ -219,12 +244,13 @@ limits leave room for that (failed checks and repeated publish errors stop the r
 
 ## Security
 
-- Every `/publisher/v1/*` route, the SSE stream included, needs a Firebase ID token. The token
-  must be for an account in `firebase-authn-plugin.identities` (uid and verified email), otherwise
-  the API answers 401. A subject the gear itself does not know gets 403.
+- Every `/publisher/v1/*` route, the SSE stream included, needs a Firebase ID token for this
+  project; anything else answers 401. A valid token alone gets only `/me` and the access request:
+  every run route answers 403 (`not_registered`, `pending_approval`, `rejected`) unless the caller
+  is an admin or an approved member, and release controls answer 403 `admin_only` to members.
   Checked on the live host: no token, a garbage token, `alg: none`, RS256 signed with a foreign key
   under Google's real `kid`, and HS256 are all refused. So are `//`, `..`, `%2F` and other path variants.
-- Caddy proxies only `/`, `/index.html`, `/favicon.svg`, `/ci`, `/runs/*`, `/assets/*` and `/publisher/v1/*`.
+- Caddy proxies only `/`, `/index.html`, `/favicon.svg`, `/ci`, `/admin`, `/runs/*`, `/assets/*` and `/publisher/v1/*`.
   types-registry REST, `/health`, `/readyz` and OpenAPI stay on 127.0.0.1. HSTS is on.
 - Listening on the public IP: 22 (SSH), 80 and 443 (Caddy). The service (8080), PostgreSQL
   (5432) and Caddy's admin API (2019) listen on loopback only; rpcbind is disabled.

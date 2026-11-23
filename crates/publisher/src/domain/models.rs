@@ -4,12 +4,91 @@ use toolkit_durable_execution::observation::{RunHistory, RunProgress};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
-/// An allowlisted person.
+/// Someone who may use the publisher.
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct Person {
     pub uid: String,
-    pub email: String,
+    pub email: Option<String>,
+    pub name: Option<String>,
+    pub role: Role,
+}
+
+impl Person {
+    /// How runs and the log name this person: the email, else the name, else the uid.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        self.email
+            .as_deref()
+            .or(self.name.as_deref())
+            .unwrap_or(&self.uid)
+    }
+
+    /// Whether this person may start, retry, resume or cancel runs of `kind`.
+    /// Everyone here may read every run.
+    #[must_use]
+    pub fn may_control(&self, kind: RunKind) -> bool {
+        match self.role {
+            Role::Admin => true,
+            Role::Member => kind == RunKind::Ci,
+        }
+    }
+}
+
+/// What a person may do.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Configured in `publisher.admins`: releases, PR CI, approving access.
+    Admin,
+    /// Approved by an admin: PR CI, and releases read-only.
+    Member,
+}
+
+/// Where an access request stands.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+impl AccessStatus {
+    pub const ALL: [Self; 3] = [Self::Pending, Self::Approved, Self::Rejected];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.as_str() == value)
+    }
+}
+
+/// Someone who asked for access, and what became of it. Admins are not stored.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct UserRecord {
+    pub subject_id: Uuid,
+    pub uid: String,
+    pub email: Option<String>,
+    pub name: Option<String>,
+    /// Firebase's `sign_in_provider`, e.g. `google.com`, `github.com`.
+    pub provider: Option<String>,
+    /// What they wrote when asking.
+    pub note: String,
+    pub status: AccessStatus,
+    pub requested_at: DateTime<Utc>,
+    pub decided_at: Option<DateTime<Utc>>,
+    /// The admin who decided, by label.
+    pub decided_by: Option<String>,
 }
 
 /// Which workflow a run belongs to.

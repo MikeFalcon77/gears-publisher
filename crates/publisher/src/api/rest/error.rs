@@ -1,5 +1,5 @@
 //! `application/problem+json` errors.
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, NoAccess};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
@@ -19,7 +19,13 @@ impl IntoResponse for ApiError {
         let (status, code) = match &self.0 {
             DomainError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             DomainError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
-            DomainError::Forbidden => (StatusCode::FORBIDDEN, "not_configured"),
+            DomainError::NoAccess(NoAccess::NotRegistered) => {
+                (StatusCode::FORBIDDEN, "not_registered")
+            }
+            DomainError::NoAccess(NoAccess::Pending) => (StatusCode::FORBIDDEN, "pending_approval"),
+            DomainError::NoAccess(NoAccess::Rejected) => (StatusCode::FORBIDDEN, "rejected"),
+            DomainError::AdminOnly => (StatusCode::FORBIDDEN, "admin_only"),
+            DomainError::TooMany(_) => (StatusCode::TOO_MANY_REQUESTS, "too_many"),
             DomainError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid"),
             DomainError::Starting => (StatusCode::SERVICE_UNAVAILABLE, "starting"),
             DomainError::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),

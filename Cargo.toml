@@ -19,7 +19,6 @@ toolkit-canonical-errors = { package = "cf-gears-toolkit-canonical-errors", vers
 toolkit-durable-execution = { package = "cf-gears-toolkit-durable-execution", version = "=0.2.0" }
 api-gateway = { package = "cf-gears-api-gateway", version = "=0.7.5" }
 authn-resolver = { package = "cf-gears-authn-resolver", version = "=0.3.3" }
-firebase-authn-plugin = { package = "cf-gears-firebase-authn-plugin", version = "=0.2.3" }
 types-registry = { package = "cf-gears-types-registry", version = "=0.7.0" }
 sea-orm = { version = "=2.0.4", default-features = false, features = ["macros", "with-json", "with-chrono", "with-uuid"] }
 sea-orm-migration = { version = "=2.0.4", default-features = false }
