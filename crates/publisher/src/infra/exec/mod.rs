@@ -132,20 +132,20 @@ impl ProcessExec {
             Some(run_as) => {
                 // sudo resets the environment and sets PATH (secure_path) and HOME for
                 // the build user; the names listed here are passed through.
-                if let Some(tmp) = &run_as.tmp_dir {
-                    vars.push(("TMPDIR".to_owned(), tmp.clone()));
-                }
                 let mut names: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
                 names.retain(|n| !INHERITED_ENV.contains(n));
-                if run_as.tmp_dir.is_some() {
-                    names.push("TMPDIR");
-                }
                 names.sort_unstable();
                 names.dedup();
                 let mut c = tokio::process::Command::new(&run_as.sudo);
                 c.args(["-n", "-u", &run_as.user]);
                 if !names.is_empty() {
                     c.arg(format!("--preserve-env={}", names.join(",")));
+                }
+                // As an argument, not --preserve-env: sudo is setuid, so glibc removes
+                // TMPDIR from its environment before sudo starts, and it is gone without
+                // an error.
+                if let Some(tmp) = &run_as.tmp_dir {
+                    c.arg(format!("TMPDIR={tmp}"));
                 }
                 c.arg("--");
                 if !cmd.secrets.is_empty() {
@@ -539,8 +539,8 @@ mod tests {
 
     #[tokio::test]
     async fn secrets_reach_the_build_user_without_passing_through_sudo() {
-        // A stand-in for sudo: records what it gets, as sudo's log would, then runs
-        // the command after `--` like sudo.
+        // A stand-in for sudo: records what it gets, as sudo's log would, sets the
+        // `VAR=value` arguments and runs the command after `--` like sudo.
         let dir = tempfile::tempdir().unwrap();
         let record = dir.path().join("sudo-saw");
         let sudo = dir.path().join("sudo");
@@ -548,7 +548,8 @@ mod tests {
             &sudo,
             format!(
                 "#!/bin/sh\n{{ printf '%s\\n' \"$@\"; env; }} > '{}'\n\
-                 while [ \"$1\" != -- ]; do shift; done; shift\nexec \"$@\"\n",
+                 while [ \"$1\" != -- ]; do case \"$1\" in [A-Z]*=*) export \"$1\";; esac; shift; done\n\
+                 shift\nexec \"$@\"\n",
                 record.display()
             ),
         )
@@ -586,9 +587,11 @@ mod tests {
         );
         let saw = std::fs::read_to_string(&record).unwrap();
         assert!(saw.contains("--preserve-env="), "{saw}");
-        // sudo resets the environment: TMPDIR is passed on explicitly.
+        // TMPDIR goes as sudo's `VAR=value` argument: a real (setuid) sudo never sees
+        // it in its environment.
+        assert!(saw.lines().any(|l| l == "TMPDIR=/build/tmp"), "{saw}");
         assert!(
-            saw.lines()
+            !saw.lines()
                 .any(|l| l.starts_with("--preserve-env=") && l.contains("TMPDIR")),
             "{saw}"
         );
