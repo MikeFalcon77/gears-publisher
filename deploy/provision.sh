@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # Prepares a fresh Ubuntu 24.04 VPS for gears-publisher. Idempotent; runs as root from
 # the synced sources (/opt/gears-publisher/src): use `deploy/deploy.sh provision <ip>`.
-# Optional environment: FIREBASE_PROJECT_ID, PUBLIC_IP (detected otherwise).
+# Optional environment (each kept from the previous run when not set):
+#   FIREBASE_PROJECT_ID  Firebase project whose sign-ins are accepted
+#   GIT_EMAIL            email of the GitHub account that opens release PRs; release-plz
+#                        commits as it (default: publisher's `git config user.email`)
+#   CARGO_JOBS           parallel rustc/link jobs (default: from CPUs and memory)
+#   PUBLIC_IP            detected otherwise
 #
-# Two users:
+# Three users:
 #   publisher        the service: GitHub login (gh), CARGO_REGISTRY_TOKEN, database.
 #                    Builds the service itself from /opt/gears-publisher/src.
 #   publisher-build  runs everything that executes gears-rust's code (checks,
@@ -55,6 +60,16 @@ fetch() {
   curl -fsSL --retry 3 -o "$3" "$1"
   echo "$2  $3" | sha256sum -c --quiet - || { echo "checksum mismatch: $1" >&2; exit 1; }
 }
+
+log "host size"
+cpus=$(nproc)
+# Rounded: a 16 GiB machine reports a little less.
+mem_gib=$(( ($(awk '/^MemTotal:/ {print $2}' /proc/meminfo) + 524288) / 1048576 ))
+disk_gib=$(( $(df --output=avail -k / | tail -1) / 1024 / 1024 ))
+echo "$cpus CPUs, $mem_gib GiB memory, $disk_gib GiB free on /"
+# A full gears-rust test build writes about 112 GiB; release and PR CI each keep a target.
+(( mem_gib >= 15 )) || echo "WARNING: under 16 GiB of memory; test builds may be killed (lower CARGO_JOBS)" >&2
+(( disk_gib >= 250 )) || echo "WARNING: under 250 GiB free; builds will start cold to save space or fail" >&2
 
 log "packages"
 apt-get update -q
@@ -188,7 +203,12 @@ echo "$PYYAML_REQUIREMENT" > "$tmp/requirements.txt"
   --require-hashes -r "$tmp/requirements.txt"
 
 log "git for the build users"
-email=$(sudo -iu publisher git config --global --get user.email || true)
+email=${GIT_EMAIL:-$(sudo -iu publisher git config --global --get user.email || true)}
+if [[ -n "$email" ]]; then
+  sudo -iu publisher git config --global user.email "$email"
+  sudo -iu publisher git config --global user.name >/dev/null \
+    || sudo -iu publisher git config --global user.name "gears-publisher"
+fi
 # git_for_builds <user> <home>
 git_for_builds() {
   local user=$1 home=$2
@@ -234,8 +254,15 @@ log "service environment"
 PUBLIC_IP=${PUBLIC_IP:-$(curl -fsS https://api.ipify.org || hostname -I | awk '{print $1}')}
 DOMAIN="${PUBLIC_IP//./-}.sslip.io"
 FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID:-$(sed -n 's/^FIREBASE_PROJECT_ID=//p' "$ETC/publisher.env" 2>/dev/null || true)}
+[[ "$FIREBASE_PROJECT_ID" == set-me ]] && FIREBASE_PROJECT_ID=
+# Kept from the previous run, so a value lowered by hand after an OOM survives.
+CARGO_JOBS=${CARGO_JOBS:-$(sed -n 's/^PUBLISHER_CARGO_JOBS=//p' "$ETC/publisher.env" 2>/dev/null || true)}
+# About 1.3 GiB per job: 16 GiB → 12.
+CARGO_JOBS=${CARGO_JOBS:-$(( mem_gib * 3 / 4 < cpus ? mem_gib * 3 / 4 : cpus ))}
+(( CARGO_JOBS >= 1 )) || CARGO_JOBS=1
 umask 027
 sed -e "s|__DB_PASSWORD__|$DB_PASSWORD|" -e "s|__FIREBASE_PROJECT_ID__|${FIREBASE_PROJECT_ID:-set-me}|" \
+  -e "s|__CARGO_JOBS__|$CARGO_JOBS|" \
   "$APP/src/deploy/publisher.env.template" > "$ETC/publisher.env"
 umask 022
 chown root:publisher "$ETC/publisher.env" && chmod 0640 "$ETC/publisher.env"
@@ -258,10 +285,23 @@ install -m 0644 "$APP/src/deploy/gears-publisher.service" /etc/systemd/system/ge
 systemctl daemon-reload
 systemctl enable gears-publisher
 
-cat <<EOF
+todo=()
+[[ -n "$FIREBASE_PROJECT_ID" ]] \
+  || todo+=("FIREBASE_PROJECT_ID is not set: run provision again with it")
+[[ -n "$email" ]] \
+  || todo+=("no git email: run provision again with GIT_EMAIL=<the GitHub account's email>")
+sudo -iu publisher gh auth status >/dev/null 2>&1 \
+  || todo+=("GitHub login: ssh root@$PUBLIC_IP, then: sudo -iu publisher gh auth login --with-token")
+grep -q '^CARGO_REGISTRY_TOKEN=.' "$ETC/secrets.env" \
+  || todo+=("crates.io token: deploy/deploy.sh secrets $PUBLIC_IP <env-file>")
+! grep -q REPLACE_WITH_FIREBASE_UID "$ETC/publisher.yaml" 2>/dev/null \
+  || todo+=("admins: edit config/publisher.local.yaml, then deploy/deploy.sh config $PUBLIC_IP")
+[[ -x "$APP/bin/publisher-server" ]] \
+  || todo+=("build and start: deploy/deploy.sh app $PUBLIC_IP")
 
-Provisioned. Domain: https://$DOMAIN
-Next:
-  1. sudo -iu publisher gh auth login        (then: git config --global user.email <noreply>)
-  2. deploy/deploy.sh app <ip> from the laptop   (builds and starts the service)
-EOF
+echo
+echo "Provisioned. Domain: https://$DOMAIN (CARGO_JOBS=$CARGO_JOBS)"
+if (( ${#todo[@]} )); then
+  echo "Still to do:"
+  printf '  - %s\n' "${todo[@]}"
+fi

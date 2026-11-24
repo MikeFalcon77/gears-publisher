@@ -6,3 +6,6 @@
 web/.env.local
 web/.env.*.local
 *.tsbuildinfo
+.claude/settings.local.json
+# Host-specific config with real admins: deploy/deploy.sh config <ip> picks it up.
+config/*.local.yaml

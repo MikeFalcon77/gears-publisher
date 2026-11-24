@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 # Laptop-side deployment over SSH (root@<ip>).
 #
-#   deploy/deploy.sh provision <ip>            sync sources, install everything (once; idempotent)
+#   deploy/deploy.sh provision <ip>            sync sources, install and configure everything
+#                                              (idempotent: run it again after any change)
 #   deploy/deploy.sh secrets <ip> <env-file>   copy CARGO_REGISTRY_TOKEN (and the optional
 #                                              read-only GITHUB_CI_TOKEN for PR CI) from a local .env
-#   deploy/deploy.sh config <ip>               install config/publisher.yaml (overwrites the admin list!)
+#   deploy/deploy.sh config <ip> [file]        install the app config (default: config/publisher.local.yaml
+#                                              if it exists, else config/publisher.yaml); replaces the admin list
 #   deploy/deploy.sh app <ip>                  sync, build UI and server on the host, restart
 #   deploy/deploy.sh status <ip>               service state and recent log
 #
+# provision reads FIREBASE_PROJECT_ID, GIT_EMAIL (the email of the GitHub account that
+# opens release PRs) and CARGO_JOBS (parallel build jobs) from the environment; each
+# is kept from the previous run when not set.
 # The UI build needs the public Firebase web config: VITE_FIREBASE_API_KEY,
 # VITE_FIREBASE_AUTH_DOMAIN, VITE_FIREBASE_PROJECT_ID in the environment or in web/.env.local.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 cmd=${1:-}; ip=${2:-}
-[[ -n "$cmd" && -n "$ip" ]] || { sed -n '2,12p' "$0"; exit 2; }
+[[ -n "$cmd" && -n "$ip" ]] || { sed -n '2,17p' "$0"; exit 2; }
 host="root@$ip"
 APP=/opt/gears-publisher
 KEY=${PUBLISHER_SSH_KEY:-$HOME/.ssh/id_ed25519_gears_publisher}
@@ -44,7 +49,8 @@ firebase_env() {
 case "$cmd" in
   provision)
     sync
-    ssh_ "FIREBASE_PROJECT_ID='${FIREBASE_PROJECT_ID:-}' PUBLIC_IP='$ip' bash $APP/src/deploy/provision.sh"
+    ssh_ "FIREBASE_PROJECT_ID=$(printf %q "${FIREBASE_PROJECT_ID:-}") GIT_EMAIL=$(printf %q "${GIT_EMAIL:-}") \
+          CARGO_JOBS=$(printf %q "${CARGO_JOBS:-}") PUBLIC_IP='$ip' bash $APP/src/deploy/provision.sh"
     ;;
   secrets)
     file=${3:?env file with CARGO_REGISTRY_TOKEN}
@@ -54,7 +60,10 @@ case "$cmd" in
     echo "secrets.env updated"
     ;;
   config)
-    scp -q "${SSH_OPTS[@]}" config/publisher.yaml "$host:/etc/gears-publisher/publisher.yaml"
+    file=${3:-config/publisher.local.yaml}
+    [[ -n "${3:-}" || -f "$file" ]] || file=config/publisher.yaml
+    echo "installing $file"
+    scp -q "${SSH_OPTS[@]}" "$file" "$host:/etc/gears-publisher/publisher.yaml"
     ssh_ "chown root:publisher /etc/gears-publisher/publisher.yaml && chmod 0640 /etc/gears-publisher/publisher.yaml && systemctl restart gears-publisher"
     echo "config installed, service restarted"
     ;;
@@ -83,6 +92,6 @@ SCRIPT
     ssh_ "systemctl --no-pager status gears-publisher caddy | head -20; journalctl -u gears-publisher -n 40 --no-pager"
     ;;
   *)
-    sed -n '2,12p' "$0"; exit 2
+    sed -n '2,17p' "$0"; exit 2
     ;;
 esac

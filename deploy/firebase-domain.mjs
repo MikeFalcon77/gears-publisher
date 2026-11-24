@@ -1,6 +1,10 @@
 // Adds an authorized domain to the Firebase project's Auth config, using the existing
 // Firebase CLI login (~/.config/configstore/firebase-tools.json). Tokens stay in memory.
-//   node deploy/firebase-domain.mjs <project-id> <domain>
+//   FIREBASE_CLIENT_ID=… FIREBASE_CLIENT_SECRET=… node deploy/firebase-domain.mjs <project-id> <domain>
+// The refresh token belongs to the Firebase CLI's OAuth client, so refreshing it needs
+// that client's id and secret: CLIENT_ID and CLIENT_SECRET in firebase-tools' src/api.ts
+// (the same variables override them in firebase-tools). Or add the domain by hand:
+// Firebase Console → Authentication → Settings → Authorized domains.
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -8,9 +12,11 @@ import { join } from 'node:path';
 const [project, domain] = process.argv.slice(2);
 if (!project || !domain) throw new Error('usage: firebase-domain.mjs <project-id> <domain>');
 
-// The Firebase CLI's public OAuth client (firebase-tools src/api.ts).
-const CLIENT_ID = '<firebase-tools CLIENT_ID>';
-const CLIENT_SECRET = '<firebase-tools CLIENT_SECRET>';
+const CLIENT_ID = process.env.FIREBASE_CLIENT_ID;
+const CLIENT_SECRET = process.env.FIREBASE_CLIENT_SECRET;
+if (!CLIENT_ID || !CLIENT_SECRET) {
+  throw new Error('set FIREBASE_CLIENT_ID and FIREBASE_CLIENT_SECRET (see the comment at the top)');
+}
 
 const store = JSON.parse(readFileSync(join(homedir(), '.config/configstore/firebase-tools.json'), 'utf8'));
 const refresh = store.tokens?.refresh_token;

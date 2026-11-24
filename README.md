@@ -4,7 +4,8 @@ Releases [constructorfabric/gears-rust](https://github.com/constructorfabric/gea
 button in a web UI. It replaces the manual laptop release: `release-plz release-pr`, merge, repeated
 `release-plz release` through crates.io 429s, `release_retry.py collect`, and a check against crates.io.
 
-- Google sign-in (Firebase). Only accounts in `config/publisher.yaml` get in.
+- Google or GitHub sign-in (Firebase). Admins are listed in the config; everyone else asks for
+  access and an admin approves them.
 - One workflow, `gears-release.v1`, on `cf-gears-toolkit-durable-execution`: every step is
   checkpointed in PostgreSQL, survives restarts and retries itself. A 429 waits until crates.io's
   `try again after` time. A failed run continues from the failed step with **Retry**.
@@ -153,7 +154,7 @@ crates/publisher          the gear, layered like gears-rust's gears:
   src/gear.rs, config.rs    wiring and configuration
 web/                      React 19 + Vite + Tailwind UI
 config/publisher.yaml     application config (admins, paths)
-deploy/                   provisioning, systemd, Caddy, deploy script, Virtuozzo spec
+deploy/                   provisioning, systemd, Caddy, sudo rules, deploy script
 ```
 
 ## Development
@@ -182,67 +183,168 @@ PUBLISHER_TEST_PG_URL=postgres://publisher:publisher@127.0.0.1:55433/publisher_t
   cargo test -p publisher --test pg_engine -- --ignored
 ```
 
-## Deployment (Virtuozzo, eu1)
+## Deployment
 
-Current instance: environment `gears-publisher`, node <id>, IP 203.0.113.7,
-<https://203-0-113-7.sslip.io>. Firebase project `<project-id>`.
+Everything runs on one Ubuntu 24.04 virtual machine. You run the commands below from your
+laptop, in this repository. `deploy/deploy.sh` connects to the machine as `root` over SSH,
+copies the sources there and runs the scripts. Nothing secret is stored in this repository:
+tokens, passwords and the list of admins live only on the machine.
 
-Size: 8 fixed cloudlets (1 GiB, always reserved: service + PostgreSQL) and 128 flexible (the
-account's per-node ceiling: 16 GiB, 20 vCPU), paid by use. The checks and `cargo publish` burst
-into the flexible part; the rest of the time the host is idle and waits for merges.
+### What you need
 
-1. **Container.** `createenvironment` refuses `region`, `extip` and `diskLimit` together
-   (API result 2395), so create it minimal and size it afterwards:
-   ```sh
-   vap env create --name gears-publisher --input deploy/spec.json --yes --wait
-   vap api call environment/control/rest/setcloudletscount --param envName=gears-publisher \
-     --param nodeType=ubuntu-vps --param fixedCloudlets=8 --param flexibleCloudlets=128 --yes
-   vap api call environment/control/rest/attachextip --param envName=gears-publisher --param nodeid=<id> --yes
-   ```
-   The disk defaults to the 400 GB maximum. Open TCP ports 80 and 443 with `environment/security/rest/addrule`.
-   SSH: add the public key with `management/account/rest/addsshkey`. It reaches the node within
-   about a minute (`execcmdbyid` does not work on VPS nodes: 4109). `deploy.sh` uses
-   `~/.ssh/id_ed25519_gears_publisher` (override with `PUBLISHER_SSH_KEY`).
-2. **Firebase** (CLI, logged in):
-   ```sh
-   firebase projects:create <id> --display-name gears-publisher
-   firebase apps:create WEB "gears-publisher web" --project <id>
-   firebase apps:sdkconfig WEB --project <id>          # → web/.env.local (VITE_FIREBASE_*)
-   # Google sign-in: firebase.json {"auth":{"providers":{"googleSignIn":{"oAuthBrandDisplayName":…,"supportEmail":…}}}}
-   firebase deploy --only auth --project <id>
-   node deploy/firebase-domain.mjs <id> <ip-with-dashes>.sslip.io
-   ```
-   GitHub sign-in (manual): create a GitHub OAuth App (Settings → Developer settings → OAuth
-   Apps) with the callback URL `https://<id>.firebaseapp.com/__/auth/handler`, then enable GitHub
-   in Firebase Console → Authentication → Sign-in method with its client id and secret.
-3. **Provision:** `FIREBASE_PROJECT_ID=<id> deploy/deploy.sh provision <ip>`. This installs the
-   packages, Go, protoc, gh, Node 24, PostgreSQL 16, Caddy, the `publisher`, `publisher-build` and
-   `publisher-ci` users with their own rustup, the cargo tools (release-plz, cargo-gears, nextest,
-   semver-checks, cargo-deny, cargo-hack) and the Python venv. Every download and tool version
-   is pinned; tarballs and `rustup-init` are checked against sha256 sums, pyyaml with
-   `--require-hashes`. It also creates the database, the sudo rule, the Caddyfile and the
-   systemd unit.
-4. **Secrets:** `deploy/deploy.sh secrets <ip> ~/projects/gears-rust/.env` copies only
-   `CARGO_REGISTRY_TOKEN` and, if present, `GITHUB_CI_TOKEN`, over stdin, into
-   `/etc/gears-publisher/secrets.env` (0600). `GITHUB_CI_TOKEN` is for PR CI: a fine-grained
-   token with read-only access to contents, for the git dependencies on GitHub (`make dylint`
-   builds its lints from cargo-gears). Without it, those checks cannot fetch them.
-5. **GitHub** (manual, on the host): `sudo -iu publisher gh auth login` and
-   `git config --global user.email` for that account (provision copies the email to the build
-   user, whose commits release-plz pushes with `GIT_TOKEN`). Better than a personal login: a
-   fine-grained token for gears-rust only (contents and pull requests: read and write), as
-   `gh auth login --with-token`.
-6. **App:** `deploy/deploy.sh app <ip>` builds the UI and the release binary on the host (as
-   `publisher`), installs them root-owned and restarts the service.
-7. **Access:** admins go under `publisher.admins` (Firebase uid and email) in
-   `/etc/gears-publisher/publisher.yaml`, then restart. `deploy/deploy.sh config <ip>` overwrites
-   that file with `config/publisher.yaml`, admins included. Everyone else signs in, asks for
-   access, and an admin approves them on `/admin`; no restart.
+- **A virtual machine** with Ubuntu 24.04 (x86-64), a public IP, and SSH access as `root`
+  with a key. Size: at least 16 GiB of memory and 250 GiB of free disk. gears-rust's tests are
+  big: one full test build writes about 112 GiB, and the release and PR CI each keep their own.
+  More CPUs make builds faster. Open TCP ports 22, 80 and 443.
+- **A Firebase project** for sign-in (free plan is enough).
+- **A GitHub account** that may push branches to gears-rust and open pull requests. The
+  release PRs are opened as this account.
+- **A crates.io API token** with permission to publish the gears crates.
+- On the laptop: `bash`, `ssh`, `rsync`, and the [Firebase CLI](https://firebase.google.com/docs/cli).
 
-Restarting the service in the middle of a step runs that step again from the beginning. That is safe
-for every step: publishing skips crates that are already published. Deploying during a long `checks`
-step costs the build time. The interrupted attempt counts against the step's retry limit; the
-limits leave room for that (failed checks and repeated publish errors stop the run on their own).
+`deploy.sh` uses the SSH key `~/.ssh/id_ed25519_gears_publisher` if it exists; set
+`PUBLISHER_SSH_KEY` to use another one. Below, `<ip>` is the machine's public IP.
+
+### 1. Set up Firebase
+
+```sh
+firebase login
+firebase projects:create <project-id> --display-name gears-publisher
+firebase apps:create WEB "gears-publisher web" --project <project-id>
+firebase apps:sdkconfig WEB --project <project-id>
+```
+
+Copy `web/.env.example` to `web/.env.local` and fill it from the `sdkconfig` output
+(`apiKey`, `authDomain`, `projectId`). These values are public: they end up in the web page.
+`web/.env.local` is not committed.
+
+Turn on sign-in in the Firebase Console → Authentication → Sign-in method:
+
+- **Google**: enable it.
+- **GitHub** (optional): create a GitHub OAuth App (GitHub → Settings → Developer settings →
+  OAuth Apps) with the callback URL `https://<project-id>.firebaseapp.com/__/auth/handler`,
+  then enable GitHub in Firebase with that app's client id and secret.
+
+Allow the site's address: Firebase Console → Authentication → Settings → Authorized domains →
+add `<ip-with-dashes>.sslip.io` (for example `203-0-113-7.sslip.io` for `203.0.113.7`).
+`deploy/firebase-domain.mjs` does the same from the command line (see the comment at its top).
+
+### 2. Provision the machine
+
+```sh
+FIREBASE_PROJECT_ID=<project-id> GIT_EMAIL=<github-account-email> deploy/deploy.sh provision <ip>
+```
+
+This takes a while the first time (it builds the Rust tools). It is safe to run again at any
+time: it only fixes what is missing or different. It does all of this:
+
+- Installs system packages, PostgreSQL 16, Caddy (HTTPS), the GitHub CLI, Node 24, Go 1.21.13
+  and protoc. Every download is pinned to a version and checked against a sha256 sum.
+- Creates three users:
+  - `publisher` runs the service. Only it can read the tokens and the database password.
+  - `publisher-build` runs gears-rust's code for releases (checks, release-plz).
+  - `publisher-ci` runs pull requests' code for PR CI. It cannot write anything the
+    release uses.
+- Gives each user its own Rust toolchain (1.98.1, with clippy, rustfmt and rust-src), and
+  installs the cargo tools (release-plz, cargo-gears, nextest, semver-checks, cargo-deny,
+  cargo-hack) and a Python venv, all owned by root so the build users cannot change them.
+- Creates the directories with the right owners and permissions. These are the fixes for
+  problems we hit when we first ran CI on the machine:
+  - each build user gets its own temp directory, so a file one user leaves in `/tmp` cannot
+    break the other's tests;
+  - `publisher-ci`'s home is `0751`, so the service can start commands in it;
+  - `publisher-ci` trusts the service's PR mirror (`git safe.directory`), so cloning a PR
+    does not fail with "dubious ownership";
+  - git serves rust-clippy's `master` from a local mirror, as gears-rust's `ci.yml` does
+    (`make dylint` needs it);
+  - the DNS search domain is removed, so names that do not exist (gears-rust's tests use
+    `unreachable.invalid`) fail to resolve, as they should. Some hosting providers answer
+    every name under their own domain.
+- Writes the sudo rules that let the service run commands as the two build users
+  (`deploy/sudoers`).
+- Sets the git name and email of all three users to `GIT_EMAIL`; release-plz commits with it.
+- Creates the database with a random password and writes `/etc/gears-publisher/publisher.env`.
+  `CARGO_JOBS` (parallel build jobs) is chosen from the machine's memory and CPUs; set
+  `CARGO_JOBS=<n>` to choose it yourself.
+- Configures Caddy for `https://<ip-with-dashes>.sslip.io` with a Let's Encrypt certificate.
+- Allows SSH with keys only and turns off rpcbind.
+- Installs the systemd service `gears-publisher`.
+
+At the end it lists what is still missing. The next steps cover it.
+
+### 3. Log in to GitHub on the machine
+
+The service uses this login to clone gears-rust, push the release branch, open the release PR
+and push tags. Use a fine-grained token limited to gears-rust (Contents: read and write, Pull
+requests: read and write), not your personal login:
+
+```sh
+ssh root@<ip>
+sudo -iu publisher gh auth login --with-token     # paste the token, then Ctrl-D
+```
+
+### 4. Copy the tokens
+
+Put the tokens in a local file (never commit it), for example `~/gears-publisher.env`:
+
+```sh
+CARGO_REGISTRY_TOKEN=cio...
+# Optional, for PR CI: a fine-grained token with read-only access to repository contents.
+# PR checks use it to download git dependencies from GitHub. Without it they fetch anonymously.
+GITHUB_CI_TOKEN=github_pat_...
+```
+
+```sh
+deploy/deploy.sh secrets <ip> ~/gears-publisher.env
+```
+
+Only these two lines are copied, through SSH's input (not the command line), into
+`/etc/gears-publisher/secrets.env` (readable by `publisher` only).
+
+### 5. Build and start the app
+
+```sh
+deploy/deploy.sh app <ip>
+```
+
+This builds the web UI and the server on the machine, installs them and restarts the service.
+Run the same command to deploy every later change. Open `https://<ip-with-dashes>.sslip.io`.
+
+### 6. Add the admins
+
+Admins start releases and approve everyone else. Sign in to the site once, then find your
+user id in the Firebase Console → Authentication → Users ("User UID"). Make a local copy of
+the config (`config/*.local.yaml` is not committed):
+
+```sh
+cp config/publisher.yaml config/publisher.local.yaml
+# edit publisher.admins in config/publisher.local.yaml: uid and email of each admin
+deploy/deploy.sh config <ip>
+```
+
+This installs the file as `/etc/gears-publisher/publisher.yaml` and restarts the service. It
+replaces the whole file, so always edit your local copy, not the file on the machine.
+Everyone else signs in, asks for access, and an admin approves them on `/admin` (no restart).
+
+### Updating
+
+- Code changes: `deploy/deploy.sh app <ip>`.
+- Changes in `deploy/` (packages, users, permissions, tool versions): `deploy/deploy.sh
+  provision <ip>`, then `deploy/deploy.sh app <ip>`.
+- Config changes: `deploy/deploy.sh config <ip>`.
+
+Restarting the service in the middle of a step runs that step again from the beginning. That is
+safe for every step: publishing skips crates that are already published. Deploying during a long
+`checks` step costs the build time. The interrupted attempt counts against the step's retry limit;
+the limits leave room for that.
+
+### PR CI and the cargo-gears fork
+
+GitHub has flagged the constructorfabric organization, so its public repositories refuse
+anonymous git. `make dylint` downloads cargo-gears from there, so PR CI downloads it from a
+public fork instead (`ci_git_rewrites` in `config/publisher.yaml`). The fork must have every
+`cargo-gears-v*` tag that gears-rust pins; when gears-rust moves to a new cargo-gears tag, push
+that tag to the fork. Remove the rewrite once the organization is unflagged.
 
 ## Security
 
@@ -281,7 +383,7 @@ limits leave room for that (failed checks and repeated publish errors stop the r
 - What remains: those commands build crates (`cargo publish` verifies), so a malicious
   dependency could read the two tokens from its environment during a release, as in GitHub
   Actions. With a personal `gh` login that token reaches all of its owner's repositories; a
-  fine-grained token for gears-rust only limits it (step 5).
+  fine-grained token for gears-rust only limits it (Deployment, step 3).
 - The UI sends a Content-Security-Policy (own scripts, Firebase sign-in only).
 - The `sslip.io` name belongs to whoever holds the IP. If the IP is released, remove it from
   Firebase's authorized domains; a domain of your own avoids this.
